@@ -13,14 +13,14 @@ use rocksdb::{DB};
 use scopeguard::defer;
 
 trait SlintDataSrc {
-    fn get_kv(&self) -> VecModel<slint::ModelRc<StandardListViewItem>>;
+    fn get_kv(&self, cf_name: &str) -> VecModel<slint::ModelRc<StandardListViewItem>>;
     fn get_cfs(&self) -> VecModel<StandardListViewItem>;
 }
 
 struct DummyData { }
 
 impl SlintDataSrc for DummyData {
-    fn get_kv(&self) -> VecModel<ModelRc<StandardListViewItem>> {
+    fn get_kv(&self, cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
         for r in 1..101 {
@@ -43,6 +43,19 @@ impl SlintDataSrc for DummyData {
             cf_data.push(slint::format!("Rust CF {i}").into());
         }
 
+        cf_data
+    }
+}
+
+struct NullData{}
+impl SlintDataSrc for NullData {
+    fn get_kv(&self, _cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
+        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+        row_data
+    }
+
+    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
+        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
         cf_data
     }
 }
@@ -71,16 +84,30 @@ impl RdbData {
             db,
         })
     }
+
+    pub fn get_val(&self, cf_name: &str, key: &str) -> Result<String, rocksdb::Error> {
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Value query time: {:?}", duration);
+        }
+        let cf_handle = self.db.cf_handle(cf_name).unwrap();
+        let v = self.db.get_cf(cf_handle, key)?.unwrap();
+        Ok(String::from_utf8(v).unwrap())
+    }
 }
 
 impl SlintDataSrc for RdbData {
-    fn get_kv(&self) -> VecModel<slint::ModelRc<StandardListViewItem>> {
-        let cf_names = &self.cf_names;
+    fn get_kv(&self, cf_name: &str) -> VecModel<slint::ModelRc<StandardListViewItem>> {
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Column family {} query time: {:?}", cf_name, duration);
+        }
+
         let db = &self.db;
 
-        let cf_handles: Vec<&rocksdb::ColumnFamily> = cf_names.iter().map(|name|{ db.cf_handle(name).unwrap() }).collect();
-
-        let cf_handle = cf_handles.get(1).unwrap();
+        let cf_handle = db.cf_handle(cf_name).unwrap();
 
         println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
 
@@ -118,24 +145,24 @@ impl SlintDataSrc for RdbData {
 fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
 
-    // let data_src = DummyData{};
-    let data_src = RdbData::new()?;
+    let rdb_data_src = Rc::new(RdbData::new()?);
 
-    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data_src.get_kv()).into());
-    ui.global::<ListViewAdapter>().set_list_items(Rc::new(data_src.get_cfs()).into());
+    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+    ui.global::<ListViewAdapter>().set_list_items(Rc::new(rdb_data_src.get_cfs()).into());
 
-    let ui_weak = ui.as_weak();
-    ui.on_change_db_value_preview(move |current_row| {
-        println!("I'm in rust now: {}", current_row);
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
+    ui.on_change_db_value_preview(move |cf, key| {
+        let ui = ui_handle.unwrap();
+        let val = rdb_data_src_clone.get_val(cf.as_str(), key.as_str()).unwrap();
+        ui.set_db_value_preview(val.into());
+    });
 
-        let ui = ui_weak.unwrap();
-        let item = ui.global::<TableViewPageAdapter>().get_row_data().row_data(current_row as usize).unwrap();
-
-        // magic values, will break easily
-        let key = item.row_data(0).unwrap().text;
-        let ui_value = item.row_data(1).unwrap().text;
-
-        ui.set_db_value_preview(slint::format!("Value for key: \"{}\" is \"{}\"", key, ui_value));
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
+    ui.on_change_column_family(move |new_cf|{
+        let ui = ui_handle.unwrap();
+        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(rdb_data_src_clone.get_kv(new_cf.as_str())).into());
     });
 
     ui.run()?;

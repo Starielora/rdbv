@@ -22,19 +22,27 @@ export component AppWindow inherits Window {
 
     // TODO probably should create a custom component for view and do this callback there
     in property <string> db_value_preview;
-    callback change_db_value_preview(int);
+    property <string> current_cf; // feels like workaround
+    property <string> current_key;
+    callback change_db_value_preview(string, string);
+    callback change_column_family(string);
 
     HorizontalBox {
 
         // I really wanted to have Tabs here, but slint does not support dynamic TabWidget - Tabs must be static
         GroupBox {
-            title: "Column families";
+            title: "Column family";
 
             // TODO probably make these dependent on column family name text length - hopefully possible in slint
             min-width: 128px;
             max-width: 256px;
             StandardListView {
                 model: ListViewAdapter.list_items;
+                current-item-changed(current-item) => {
+                    let new_cf = ListViewAdapter.list_items[current-item].text;
+                    change_column_family(new_cf);
+                    current_cf = new_cf;
+                }
             }
         }
 
@@ -50,16 +58,28 @@ export component AppWindow inherits Window {
 
                 current-row-changed(current-row) => {
                     debug("Current row index: ", current-row);
-                    change_db_value_preview(current-row);
+                    let key = TableViewPageAdapter.row_data[current-row][0].text;
+                    change_db_value_preview(current_cf, key);
+                    current_key = key;
                 }
             }
 
             GroupBox {
-                title: "Value preview";
-                TextEdit {
-                    min-height: 64px;
-                    read-only: true;
-                    text: db_value_preview;
+                title: "preview";
+                VerticalLayout {
+                    TextEdit {
+                        height: 46px;
+                        preferred-height: 46px;
+                        read-only: true;
+                        text: current_key;
+                        enabled: !current_key.is-empty;
+                    }
+                    TextEdit {
+                        min-height: 64px;
+                        read-only: true;
+                        text: db_value_preview;
+                        enabled: !current_key.is-empty;
+                    }
                 }
             }
 
