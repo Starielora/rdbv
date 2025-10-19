@@ -21,6 +21,7 @@ scopeguard = "1.2.0"
 slint = "1.13.1"
 rust-embed = "8.8.0"
 formatjson = "0.3.1"
+rfd = "0.15.4"
 
 [build-dependencies]
 slint-build = "1.13.1"

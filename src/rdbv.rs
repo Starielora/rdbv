@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::error::Error;
+use std::{cell::RefCell, error::Error};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -97,6 +97,21 @@ fn format_hex_ascii(val: &[u8]) -> String {
         result.push_str(format!("{} |{}\n", hex_part, ascii_part).as_str());
     };
 
+    // TODO there's gotta be a better way...
+    let format_remainder = |chunk: &[u8], hex_part: &mut String, ascii_part: &mut String, result: &mut String|  {
+        ascii_part.clear();
+        hex_part.clear();
+        for c in chunk {
+            hex_part.push_str(format!(" {:02X}", *c).as_str());
+            ascii_part.push(format_ascii_u8(*c));
+        }
+        for _ in 0..(16-chunk.len()) {
+            hex_part.push_str("   ");
+            ascii_part.push_str(" ");
+        }
+        result.push_str(format!("{} |{}\n", hex_part, ascii_part).as_str());
+    };
+
     let mut result = String::new();
     let mut ascii_part = String::new();
     let mut hex_part = String::new();
@@ -107,7 +122,7 @@ fn format_hex_ascii(val: &[u8]) -> String {
     }
 
     if !remainder.is_empty() {
-        format_chunk(remainder, &mut hex_part, &mut ascii_part, &mut result);
+        format_remainder(remainder, &mut hex_part, &mut ascii_part, &mut result);
     }
 
     result
@@ -124,7 +139,13 @@ fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Erro
     match std::str::from_utf8(val) {
         Ok(v) => {
             return match formatting {
-                Formatting::None(_) => Ok(v.to_string()),
+                Formatting::None(_) => {
+                    let mut result = String::from(v);
+                    if was_cut {
+                        result.push('…');
+                    }
+                    Ok(result)
+                },
                 Formatting::Json() => {
                     return match formatjson::format_json(v) {
                         Ok(v) => Ok(v),
@@ -153,7 +174,7 @@ fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Erro
 }
 
 impl RdbData {
-    pub fn new() -> Result<Self, rocksdb::Error> {
+    pub fn new(path: String) -> Result<Self, rocksdb::Error> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -162,7 +183,7 @@ impl RdbData {
         let opts = rocksdb::Options::default();
         const PATH: &str = "temp_base";
 
-        let cf_names = rocksdb::DB::list_cf(&opts, PATH)?;
+        let cf_names = rocksdb::DB::list_cf(&opts, path)?;
 
         let error_if_log_file_exists = false; // should be true, but fucking rocks does not clean up itself properly
         let db = rocksdb::DB::open_cf_for_read_only(&opts, PATH, &cf_names, error_if_log_file_exists)?;
@@ -237,10 +258,9 @@ impl SlintDataSrc for RdbData {
 fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
 
-    let rdb_data_src = Rc::new(RdbData::new()?);
+    let mut rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
-    ui.global::<ListViewAdapter>().set_list_items(Rc::new(rdb_data_src.get_cfs()).into());
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
@@ -259,7 +279,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "hex" => Formatting::Hex(2048),
             _ => Formatting::None(2048)
         };
-        match rdb_data_src_clone.get_val(cf.as_str(), key.as_str(), formatting) {
+        match rdb_data_src_clone.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
             Ok(val) => {
                 ui.set_db_value_preview(val.into());
                 ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
@@ -276,10 +296,69 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let ui = ui_handle.unwrap();
         let start = Instant::now();
-        let data = rdb_data_src_clone.get_kv(new_cf.as_str());
+        let data = rdb_data_src_clone.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str());
         let duration = start.elapsed();
         ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
         ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
+    });
+
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_handle = rdb_data_src.clone(); // huh, pls help
+    ui.global::<DbLoader>().on_load_db(move |path| {
+        let ui = ui_handle.unwrap();
+        println!("{}", path.as_str());
+        let mut db = rdb_data_src_handle.borrow_mut();
+        let start = Instant::now();
+        let db_open_result = RdbData::new(path.to_string());
+
+        if db_open_result.is_err() {
+            println!("{}", db_open_result.err().unwrap().into_string());
+            return;
+        }
+
+        let new_data_src = db_open_result.unwrap();
+        let duration = start.elapsed();
+        *db = Some(new_data_src);
+
+        let src = db.as_ref().unwrap();
+        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+        ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
+        ui.set_page_index(1);
+        ui.set_status_msg(format!("Db open time: {:?}", duration).into());
+    });
+
+    // TODO this shares most code with on_load_db
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_handle = rdb_data_src.clone(); // huh, pls help
+    ui.global::<DbLoader>().on_browse_for_db(move ||{
+        let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
+
+        match folder {
+            Some(path) => {
+                let ui = ui_handle.unwrap();
+                println!("{:?}", path);
+                let mut db = rdb_data_src_handle.borrow_mut();
+                let start = Instant::now();
+                let db_open_result = RdbData::new(path.into_os_string().into_string().unwrap());
+
+                if db_open_result.is_err() {
+                    println!("{}", db_open_result.err().unwrap().into_string());
+                    return;
+                }
+
+                let new_data_src = db_open_result.unwrap();
+
+                let duration = start.elapsed();
+                *db = Some(new_data_src);
+
+                let src = db.as_ref().unwrap();
+                ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+                ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
+                ui.set_page_index(1);
+                ui.set_status_msg(format!("Db open time: {:?}", duration).into());
+            },
+            None => {},
+        }
     });
 
     ui.run()?;
