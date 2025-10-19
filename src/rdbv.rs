@@ -15,36 +15,6 @@ trait SlintDataSrc {
     fn get_cfs(&self) -> VecModel<StandardListViewItem>;
 }
 
-struct DummyData { }
-
-impl SlintDataSrc for DummyData {
-    fn get_kv(&self, _cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
-        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
-
-        for r in 1..101 {
-            let items = Rc::new(VecModel::default());
-
-            items.push(slint::format!("Rust key {r}").into());
-            items.push(slint::format!("Rust value {r}").into());
-
-            row_data.push(items.into());
-        }
-
-        row_data
-    }
-
-    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
-        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-
-        for i in 1..5 {
-
-            cf_data.push(slint::format!("Rust CF {i}").into());
-        }
-
-        cf_data
-    }
-}
-
 struct NullData{}
 impl SlintDataSrc for NullData {
     fn get_kv(&self, _cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
@@ -149,7 +119,7 @@ fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Erro
                 Formatting::Json() => {
                     return match formatjson::format_json(v) {
                         Ok(v) => Ok(v),
-                        Err(err) => Err("Nah bro, can't format as json")?,
+                        Err(_err) => Err("Nah bro, can't format as json")?,
                     }
                 },
                 Formatting::Hex(_) => Ok(format_hex_ascii(val)),
@@ -258,7 +228,7 @@ impl SlintDataSrc for RdbData {
 fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
 
-    let mut rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
+    let rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
 
