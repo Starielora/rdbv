@@ -63,12 +63,22 @@ struct RdbData{
     db: rocksdb::DB,
 }
 
-fn parse_val(val: &[u8], max_chars: usize, formatting: &str) -> String
+fn parse_val(val: &[u8], max_chars: usize, formatting: &str) -> Result<String, Box<dyn Error>>
 {
     let was_cut = val.len() > max_chars;
     let val = val.get(..usize::min(max_chars, val.len())).unwrap();
-    let mut parsed = match std::str::from_utf8(val) {
-        Ok(v) => v.to_string(),
+    match std::str::from_utf8(val) {
+        Ok(v) => {
+
+            if formatting.eq("json") {
+                return match formatjson::format_json(v) {
+                    Ok(v) => Ok(v),
+                    Err(err) => Err("Nah bro, can't parse as json")?,
+                };
+            }
+
+            Ok(v.to_string())
+        },
         Err(_) => { // treat as a blob, bro
 
             let mut result = String::new();
@@ -94,6 +104,8 @@ fn parse_val(val: &[u8], max_chars: usize, formatting: &str) -> String
                     }
                     result.push_str(format!("{} |{}\n", hex_part, ascii_part).as_str());
                 }
+            } else if formatting.eq("json") {
+                Err("Nah bro, can't parse it as json")?
             } else {
                 for chunk in val_chunks {
                     let mut ascii_part = String::new();
@@ -109,15 +121,13 @@ fn parse_val(val: &[u8], max_chars: usize, formatting: &str) -> String
                 }
             }
 
-            result
+            if was_cut {
+                result.push('…');
+            }
+
+            Ok(result)
         },
-    };
-
-    if was_cut {
-        parsed.push('…');
     }
-
-    parsed
 }
 
 impl RdbData {
@@ -141,7 +151,7 @@ impl RdbData {
         })
     }
 
-    pub fn get_val(&self, cf_name: &str, key: &str, formatting: &str) -> Result<String, rocksdb::Error> {
+    pub fn get_val(&self, cf_name: &str, key: &str, formatting: &str) -> Result<String, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -150,7 +160,7 @@ impl RdbData {
 
         let cf_handle = self.db.cf_handle(cf_name).unwrap();
         let v = self.db.get_pinned_cf(cf_handle, key)?.unwrap();
-        Ok(parse_val(&v, 2048, formatting))
+        parse_val(&v, 2048, formatting)
     }
 
 }
@@ -177,7 +187,7 @@ impl SlintDataSrc for RdbData {
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
             let val = it.value().unwrap();
 
-            let val_str = parse_val(&val, 64, "None");
+            let val_str = parse_val(&val, 64, "None").unwrap();
 
             let items = Rc::new(VecModel::default());
             items.push(key.into());
@@ -214,8 +224,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
     ui.on_change_db_value_preview(move |cf, key, formatting| {
         let ui = ui_handle.unwrap();
-        let val = rdb_data_src_clone.get_val(cf.as_str(), key.as_str(), formatting.as_str()).unwrap();
-        ui.set_db_value_preview(val.into());
+        let start = Instant::now();
+        ui.set_db_value_preview("".into());
+        match rdb_data_src_clone.get_val(cf.as_str(), key.as_str(), formatting.as_str()) {
+            Ok(val) => {
+                ui.set_db_value_preview(val.into());
+                ui.set_status_msg(format!("Query time (with parsing): {:?}", start.elapsed()).into());
+            }
+            Err(e) => ui.set_status_msg(e.to_string().into()),
+        }
     });
 
     let ui_handle = ui.as_weak();
