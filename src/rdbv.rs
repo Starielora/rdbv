@@ -275,7 +275,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             return;
         }
         let ui = ui_handle.unwrap();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(rdb_data_src_clone.get_kv(new_cf.as_str())).into());
+        let start = Instant::now();
+        let data = rdb_data_src_clone.get_kv(new_cf.as_str());
+        let duration = start.elapsed();
+        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
+        ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
     });
 
     ui.run()?;
