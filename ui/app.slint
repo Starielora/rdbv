@@ -21,6 +21,8 @@ export component AppWindow inherits Window {
     default-font-family: "Consolas"; // No idea how to change font specifically for one TextEdit. I need this to render blobs in hex.
     default-font-size: 16px;
     title: "rdbv";
+    preferred-width: 960px;
+    preferred-height: 720px;
 
     // TODO probably should create a custom component for view and do this callback there
     in property <string> db_value_preview;

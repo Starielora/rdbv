@@ -65,37 +65,52 @@ struct RdbData{
     db: rocksdb::DB,
 }
 
-fn parse_val(val: &[u8], max_chars: usize) -> String
+fn parse_val(val: &[u8], max_chars: usize, blob_with_hex: bool) -> String
 {
     let was_cut = val.len() > max_chars;
     let val = val.get(..usize::min(max_chars, val.len())).unwrap();
     let mut parsed = match std::str::from_utf8(val) {
         Ok(v) => v.to_string(),
-        Err(_) => {
+        Err(_) => { // treat as a blob, bro
 
-            // TODO cool, but requires extra panel and mono font to display nicely
-            // let mut result = String::new();
-            // let hex_iter = val.iter().take(64)
-            //                   .map(|b| format!("{:02X}", b));
-            
-            // for (i, hex) in hex_iter.enumerate() {
-            //     if i > 0 && i % 16 == 0 {
-            //         result.push('\n');
-            //     }
-            //     result.push_str(&hex);
-            //     result.push(' ');
-            // }
-            // result
+            let mut result = String::new();
+
+            let (val_chunks, _remainder) = val.as_chunks::<16>();
 
             // TODO This must be slow af, pls fix
-            let mut result = String::new();
-            for c in val {
-                if !c.is_ascii_graphic() {
-                    result.push('.');
-                } else {
-                    result.push(char::from_u32((*c).into()).unwrap());
+            // TODO iterator magic? pls be faster? maybe separate panel would be better
+            if blob_with_hex {
+                for chunk in val_chunks {
+                    let mut ascii_part = String::new();
+                    let mut hex_part = String::new();
+                    for c in chunk {
+                        let hex_str = format!("{:02X}", *c);
+                        hex_part.push_str(format!(" {}", hex_str).as_str());
+
+                        if !c.is_ascii_graphic() {
+                            ascii_part.push('.');
+                        } else {
+                            ascii_part.push(char::from_u32((*c).into()).unwrap());
+                        }
+
+                    }
+                    result.push_str(format!("{} |{}\n", hex_part, ascii_part).as_str());
+                }
+            } else {
+                for chunk in val_chunks {
+                    let mut ascii_part = String::new();
+                    for c in chunk {
+                        if !c.is_ascii_graphic() {
+                            ascii_part.push('.');
+                        } else {
+                            ascii_part.push(char::from_u32((*c).into()).unwrap());
+                        }
+
+                    }
+                    result.push_str(ascii_part.as_str());
                 }
             }
+
             result
         },
     };
@@ -137,7 +152,7 @@ impl RdbData {
 
         let cf_handle = self.db.cf_handle(cf_name).unwrap();
         let v = self.db.get_pinned_cf(cf_handle, key)?.unwrap();
-        Ok(parse_val(&v, 2048))
+        Ok(parse_val(&v, 2048, true))
     }
 
 }
@@ -164,7 +179,7 @@ impl SlintDataSrc for RdbData {
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
             let val = it.value().unwrap();
 
-            let val_str = parse_val(&val, 64);
+            let val_str = parse_val(&val, 64, false);
 
             let items = Rc::new(VecModel::default());
             items.push(key.into());
