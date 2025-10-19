@@ -28,7 +28,8 @@ export component AppWindow inherits Window {
     in property <string> db_value_preview;
     property <string> current_cf; // feels like workaround
     property <string> current_key;
-    callback change_db_value_preview(string, string);
+    property <string> current_formatting;
+    callback change_db_value_preview(string, string, string);
     callback change_column_family(string);
 
     HorizontalBox {
@@ -61,10 +62,9 @@ export component AppWindow inherits Window {
                 rows: TableViewPageAdapter.row_data;
 
                 current-row-changed(current-row) => {
-                    debug("Current row index: ", current-row);
                     let key = TableViewPageAdapter.row_data[current-row][0].text;
-                    change_db_value_preview(current_cf, key);
                     current_key = key;
+                    change_db_value_preview(current_cf, current_key, current_formatting);
                 }
             }
 
@@ -94,7 +94,12 @@ export component AppWindow inherits Window {
                     text: "Format";
                 }
                 ComboBox {
-                    model: ["None", "json"];
+                    model: ["None", "json", "hex"];
+                    init => { current_formatting = "None" }
+                    selected(current-value) => {
+                        current_formatting = current-value;
+                        change_db_value_preview(current_cf, current_key, current_formatting);
+                    }
                 }
             }
         }

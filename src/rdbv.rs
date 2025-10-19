@@ -1,15 +1,13 @@
-// Prevent console window in addition to Slint window in Windows release builds when, e.g., starting the app via file manager. Ignored on other platforms.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::error::Error;
 use std::rc::Rc;
 use std::time::Instant;
 
-use slint::{Model, ModelRc, StandardListViewItem, VecModel};
+use slint::{ModelRc, StandardListViewItem, VecModel};
 
 slint::include_modules!();
 
-use rocksdb::{DB};
 use scopeguard::defer;
 
 trait SlintDataSrc {
@@ -20,7 +18,7 @@ trait SlintDataSrc {
 struct DummyData { }
 
 impl SlintDataSrc for DummyData {
-    fn get_kv(&self, cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
+    fn get_kv(&self, _cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
         for r in 1..101 {
@@ -65,7 +63,7 @@ struct RdbData{
     db: rocksdb::DB,
 }
 
-fn parse_val(val: &[u8], max_chars: usize, blob_with_hex: bool) -> String
+fn parse_val(val: &[u8], max_chars: usize, formatting: &str) -> String
 {
     let was_cut = val.len() > max_chars;
     let val = val.get(..usize::min(max_chars, val.len())).unwrap();
@@ -79,7 +77,7 @@ fn parse_val(val: &[u8], max_chars: usize, blob_with_hex: bool) -> String
 
             // TODO This must be slow af, pls fix
             // TODO iterator magic? pls be faster? maybe separate panel would be better
-            if blob_with_hex {
+            if formatting.eq("hex") {
                 for chunk in val_chunks {
                     let mut ascii_part = String::new();
                     let mut hex_part = String::new();
@@ -143,7 +141,7 @@ impl RdbData {
         })
     }
 
-    pub fn get_val(&self, cf_name: &str, key: &str) -> Result<String, rocksdb::Error> {
+    pub fn get_val(&self, cf_name: &str, key: &str, formatting: &str) -> Result<String, rocksdb::Error> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -152,7 +150,7 @@ impl RdbData {
 
         let cf_handle = self.db.cf_handle(cf_name).unwrap();
         let v = self.db.get_pinned_cf(cf_handle, key)?.unwrap();
-        Ok(parse_val(&v, 2048, true))
+        Ok(parse_val(&v, 2048, formatting))
     }
 
 }
@@ -179,7 +177,7 @@ impl SlintDataSrc for RdbData {
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
             let val = it.value().unwrap();
 
-            let val_str = parse_val(&val, 64, false);
+            let val_str = parse_val(&val, 64, "None");
 
             let items = Rc::new(VecModel::default());
             items.push(key.into());
@@ -214,9 +212,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
-    ui.on_change_db_value_preview(move |cf, key| {
+    ui.on_change_db_value_preview(move |cf, key, formatting| {
         let ui = ui_handle.unwrap();
-        let val = rdb_data_src_clone.get_val(cf.as_str(), key.as_str()).unwrap();
+        let val = rdb_data_src_clone.get_val(cf.as_str(), key.as_str(), formatting.as_str()).unwrap();
         ui.set_db_value_preview(val.into());
     });
 
