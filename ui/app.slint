@@ -1,0 +1,78 @@
+import { TabWidget, ListView, StandardTableView, StandardListView, GroupBox, HorizontalBox, TextEdit, VerticalBox, GridBox, ComboBox } from "std-widgets.slint";
+
+export global TableViewPageAdapter  {
+    in property <[[StandardListViewItem]]> row_data: [
+        [{text:"key1"}, { text:"val1"}],
+        [{text:"key2"}, { text:"val2"}],
+        [{text:"key3"}, { text:"val3"}],
+    ];
+}
+
+export global ListViewAdapter {
+    in property <[StandardListViewItem]> list_items: [
+        {text: "cf1" },
+        {text: "cf2" },
+        {text: "cf3" },
+        {text: "cf4" },
+    ];
+}
+
+export component AppWindow inherits Window {
+    title: "rdbv";
+
+    // TODO probably should create a custom component for view and do this callback there
+    in property <string> db_value_preview;
+    callback change_db_value_preview(int);
+
+    HorizontalBox {
+
+        // I really wanted to have Tabs here, but slint does not support dynamic TabWidget - Tabs must be static
+        GroupBox {
+            title: "Column families";
+
+            // TODO probably make these dependent on column family name text length - hopefully possible in slint
+            min-width: 128px;
+            max-width: 256px;
+            StandardListView {
+                model: ListViewAdapter.list_items;
+            }
+        }
+
+        VerticalLayout {
+
+            StandardTableView {
+                columns: [
+                            { title: @tr("key") },
+                            { title: @tr("value") },
+                        ];
+
+                rows: TableViewPageAdapter.row_data;
+
+                current-row-changed(current-row) => {
+                    debug("Current row index: ", current-row);
+                    change_db_value_preview(current-row);
+                }
+            }
+
+            GroupBox {
+                title: "Value preview";
+                TextEdit {
+                    min-height: 64px;
+                    read-only: true;
+                    text: db_value_preview;
+                }
+            }
+
+            HorizontalBox {
+                alignment: end;
+                Text {
+                    vertical-alignment: center;
+                    text: "Format";
+                }
+                ComboBox {
+                    model: ["None", "json"];
+                }
+            }
+        }
+    }
+}
