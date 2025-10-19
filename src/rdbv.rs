@@ -223,6 +223,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ui_handle = ui.as_weak();
     let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
     ui.on_change_db_value_preview(move |cf, key, formatting| {
+        if cf.is_empty() || key.is_empty() || formatting.is_empty() {
+            return;
+        }
+
         let ui = ui_handle.unwrap();
         let start = Instant::now();
         ui.set_db_value_preview("".into());
@@ -238,6 +242,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ui_handle = ui.as_weak();
     let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
     ui.on_change_column_family(move |new_cf|{
+        if new_cf.is_empty() {
+            return;
+        }
         let ui = ui_handle.unwrap();
         ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(rdb_data_src_clone.get_kv(new_cf.as_str())).into());
     });
