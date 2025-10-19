@@ -1,6 +1,12 @@
 use std::time::Instant;
 
 use scopeguard::defer;
+use rust_embed::Embed;
+
+#[derive(Embed)]
+#[folder = "assets/"]
+struct Assets;
+
 
 const COLUMN_FAMILIES: [&'static str; 3] = ["Job", "Setup", "Scan"];
 
@@ -19,6 +25,25 @@ fn put_job_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rock
     db.put_cf(cf, "Job_k1", "Job_v1")?;
     db.put_cf(cf, "Job_k2", "Job_v2")?;
     db.put_cf(cf, "Job_k3", "Job_v3")?;
+    let text = r#"commonly used names of animals and plants, such as トカゲ (tokage, "lizard"), ネコ (neko, "cat") and バラ (bara, "rose"), and certain other technical and scientific terms, including chemical and mineral names such as カリウム (kariumu, "potassium"), ポリマー (porimā, "polymer") and ベリル (beriru, "beryl")"#;
+    db.put_cf(cf, "Job_k3", text)?;
+
+    let img = Assets::get("satisfactory-753268177.jpg").unwrap();
+    db.put_cf(cf, "image", img.data.as_ref())?;
+
+    let json = r#"{"name": "John Doe","age": 43,"phones": ["+44 1234567","+44 2345678"]}"#;
+    let json2 = r#"
+        {
+            "name": "John Doe",
+            "age": 43,
+            "phones": [
+                "+44 1234567",
+                "+44 2345678"
+            ]
+        }"#;
+
+    db.put_cf(cf, "json", json)?;
+    db.put_cf(cf, "json formatted", json2)?;
 
     Ok(())
 }
@@ -37,6 +62,11 @@ fn put_scan_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), roc
     db.put_cf(cf, "Scan_k1", "Scan_v1")?;
     db.put_cf(cf, "Scan_k2", "Scan_v2")?;
     db.put_cf(cf, "Scan_k3", "Scan_v3")?;
+
+    let img = Assets::get("satisfactory-753268177.jpg").unwrap();
+    for i in 0..1024 {
+        db.put_cf(cf, format!("img {}", i), img.data.as_ref())?;
+    }
 
     Ok(())
 }

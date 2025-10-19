@@ -65,6 +65,48 @@ struct RdbData{
     db: rocksdb::DB,
 }
 
+fn parse_val(val: &[u8], max_chars: usize) -> String
+{
+    let was_cut = val.len() > max_chars;
+    let val = val.get(..usize::min(max_chars, val.len())).unwrap();
+    let mut parsed = match std::str::from_utf8(val) {
+        Ok(v) => v.to_string(),
+        Err(_) => {
+
+            // TODO cool, but requires extra panel and mono font to display nicely
+            // let mut result = String::new();
+            // let hex_iter = val.iter().take(64)
+            //                   .map(|b| format!("{:02X}", b));
+            
+            // for (i, hex) in hex_iter.enumerate() {
+            //     if i > 0 && i % 16 == 0 {
+            //         result.push('\n');
+            //     }
+            //     result.push_str(&hex);
+            //     result.push(' ');
+            // }
+            // result
+
+            // TODO This must be slow af, pls fix
+            let mut result = String::new();
+            for c in val {
+                if !c.is_ascii_graphic() {
+                    result.push('.');
+                } else {
+                    result.push(char::from_u32((*c).into()).unwrap());
+                }
+            }
+            result
+        },
+    };
+
+    if was_cut {
+        parsed.push('…');
+    }
+
+    parsed
+}
+
 impl RdbData {
     pub fn new() -> Result<Self, rocksdb::Error> {
         let start = Instant::now();
@@ -77,7 +119,8 @@ impl RdbData {
 
         let cf_names = rocksdb::DB::list_cf(&opts, PATH)?;
 
-        let db = rocksdb::DB::open_cf_for_read_only(&opts, PATH, &cf_names, true)?;
+        let error_if_log_file_exists = false; // should be true, but fucking rocks does not clean up itself properly
+        let db = rocksdb::DB::open_cf_for_read_only(&opts, PATH, &cf_names, error_if_log_file_exists)?;
 
         Ok(Self {
             cf_names,
@@ -91,10 +134,12 @@ impl RdbData {
             let duration = start.elapsed();
             println!("Value query time: {:?}", duration);
         }
+
         let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_cf(cf_handle, key)?.unwrap();
-        Ok(String::from_utf8(v).unwrap())
+        let v = self.db.get_pinned_cf(cf_handle, key)?.unwrap();
+        Ok(parse_val(&v, 2048))
     }
+
 }
 
 impl SlintDataSrc for RdbData {
@@ -117,11 +162,13 @@ impl SlintDataSrc for RdbData {
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
         while it.valid() {
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
-            let val = std::str::from_utf8(it.value().unwrap()).unwrap();
+            let val = it.value().unwrap();
+
+            let val_str = parse_val(&val, 64);
 
             let items = Rc::new(VecModel::default());
             items.push(key.into());
-            items.push(val.into());
+            items.push(val_str.as_str().into());
 
             row_data.push(items.into());
 
