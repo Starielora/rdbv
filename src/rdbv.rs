@@ -55,6 +55,7 @@ fn format_ascii(val: &[u8]) -> String {
 
 // TODO This must be slow af, pls fix
 // TODO iterator magic? pls be faster? maybe separate panel would be better
+// unless llvm saves me here... in any case check later
 fn format_hex_ascii(val: &[u8]) -> String {
 
     let format_chunk = |chunk: &[u8], hex_part: &mut String, ascii_part: &mut String, result: &mut String| {
@@ -171,8 +172,13 @@ impl RdbData {
             println!("Value query time: {:?}", duration);
         }
 
+        println!("Query: {:?}", key);
         let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_pinned_cf(cf_handle, key)?.unwrap();
+        let v = self.db.get_pinned_cf(cf_handle, key)?;
+        if v.is_none() {
+            Err(format!("Failed to get pinned value for key {:?}", key))?
+        }
+        let v = v.unwrap();
         format_val(&v, formatting)
     }
 
@@ -231,9 +237,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+    ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
 
     let ui_handle = ui.as_weak();
-    let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
+    let rdb_data_src_handle = rdb_data_src.clone();
     ui.on_change_db_value_preview(move |cf, key, ui_formatting| {
         if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
             return;
@@ -249,7 +256,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "hex" => Formatting::Hex(2048),
             _ => Formatting::None(2048)
         };
-        match rdb_data_src_clone.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
+        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
             Ok(val) => {
                 ui.set_db_value_preview(val.into());
                 ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
@@ -259,24 +266,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let ui_handle = ui.as_weak();
-    let rdb_data_src_clone = rdb_data_src.clone(); // huh, pls help
+    let rdb_data_src_handle = rdb_data_src.clone();
     ui.on_change_column_family(move |new_cf|{
         if new_cf.is_empty() {
             return;
         }
         let ui = ui_handle.unwrap();
         let start = Instant::now();
-        let data = rdb_data_src_clone.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str());
+        let data = rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str());
         let duration = start.elapsed();
         ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
         ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
     });
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone(); // huh, pls help
-    ui.global::<DbLoader>().on_load_db(move |path| {
+    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Rc<RefCell<Option<RdbData>>>| {
+
         let ui = ui_handle.unwrap();
-        println!("{}", path.as_str());
+        println!("{:?}", path.as_str());
         let mut db = rdb_data_src_handle.borrow_mut();
         let start = Instant::now();
         let db_open_result = RdbData::new(path.to_string());
@@ -293,39 +299,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         let src = db.as_ref().unwrap();
         ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
         ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
-        ui.set_page_index(1);
         ui.set_status_msg(format!("Db open time: {:?}", duration).into());
+        ui.set_loaded_db_path(path.into());
+    };
+
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_handle = rdb_data_src.clone();
+    ui.global::<DbLoader>().on_load_db(move |path| {
+        open_db(path.to_string(), &ui_handle, &rdb_data_src_handle);
     });
 
-    // TODO this shares most code with on_load_db
     let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone(); // huh, pls help
+    let rdb_data_src_handle = rdb_data_src.clone();
     ui.global::<DbLoader>().on_browse_for_db(move ||{
         let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
 
         match folder {
             Some(path) => {
-                let ui = ui_handle.unwrap();
-                println!("{:?}", path);
-                let mut db = rdb_data_src_handle.borrow_mut();
-                let start = Instant::now();
-                let db_open_result = RdbData::new(path.into_os_string().into_string().unwrap());
-
-                if db_open_result.is_err() {
-                    println!("{}", db_open_result.err().unwrap().into_string());
-                    return;
-                }
-
-                let new_data_src = db_open_result.unwrap();
-
-                let duration = start.elapsed();
-                *db = Some(new_data_src);
-
-                let src = db.as_ref().unwrap();
-                ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
-                ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
-                ui.set_page_index(1);
-                ui.set_status_msg(format!("Db open time: {:?}", duration).into());
+                let path = path.into_os_string().into_string().unwrap();
+                open_db(path, &ui_handle, &rdb_data_src_handle);
             },
             None => {},
         }

@@ -8,7 +8,7 @@ use rust_embed::Embed;
 struct Assets;
 
 
-const COLUMN_FAMILIES: [&'static str; 3] = ["Job", "Setup", "Scan"];
+const COLUMN_FAMILIES: [&'static str; 3] = ["CF1", "CF2", "CF3"];
 
 fn setup_column_families(db: &mut rocksdb::DB) -> Result<(), rocksdb::Error> {
     let opts = rocksdb::Options::default();
@@ -22,13 +22,13 @@ fn setup_column_families(db: &mut rocksdb::DB) -> Result<(), rocksdb::Error> {
 
 fn put_job_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rocksdb::Error> {
 
-    db.put_cf(cf, "Job_k1", "Job_v1")?;
-    db.put_cf(cf, "Job_k2", "Job_v2")?;
-    db.put_cf(cf, "Job_k3", "Job_v3")?;
+    db.put_cf(cf, "CF1_k1", "CF1_v1")?;
+    db.put_cf(cf, "CF1_k2", "CF1_v2")?;
+    db.put_cf(cf, "CF1_k3", "CF1_v3")?;
     let text = r#"commonly used names of animals and plants, such as トカゲ (tokage, "lizard"), ネコ (neko, "cat") and バラ (bara, "rose"), and certain other technical and scientific terms, including chemical and mineral names such as カリウム (kariumu, "potassium"), ポリマー (porimā, "polymer") and ベリル (beriru, "beryl")"#;
-    db.put_cf(cf, "Job_k3", text)?;
+    db.put_cf(cf, "CF1_k3", text)?;
 
-    let img = Assets::get("satisfactory-753268177.jpg").unwrap();
+    let img = Assets::get("20251020200239_1.jpg").unwrap();
     db.put_cf(cf, "image", img.data.as_ref())?;
 
     let json = r#"{"name": "John Doe","age": 43,"phones": ["+44 1234567","+44 2345678"]}"#;
@@ -50,20 +50,20 @@ fn put_job_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rock
 
 fn put_setup_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rocksdb::Error> {
 
-    db.put_cf(cf, "Setup_k1", "Setup_v1")?;
-    db.put_cf(cf, "Setup_k2", "Setup_v2")?;
-    db.put_cf(cf, "Setup_k3", "Setup_v3")?;
+    db.put_cf(cf, "CF2_k1", "CF2_v1")?;
+    db.put_cf(cf, "CF2_k2", "CF2_v2")?;
+    db.put_cf(cf, "CF2_k3", "CF2_v3")?;
 
     Ok(())
 }
 
 fn put_scan_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rocksdb::Error> {
 
-    db.put_cf(cf, "Scan_k1", "Scan_v1")?;
-    db.put_cf(cf, "Scan_k2", "Scan_v2")?;
-    db.put_cf(cf, "Scan_k3", "Scan_v3")?;
+    db.put_cf(cf, "CF3_k1", "CF3_v1")?;
+    db.put_cf(cf, "CF3_k2", "CF3_v2")?;
+    db.put_cf(cf, "CF3_k3", "CF3_v3")?;
 
-    let img = Assets::get("satisfactory-753268177.jpg").unwrap();
+    let img = Assets::get("20251020200239_1.jpg").unwrap();
     for i in 0..1024 {
         db.put_cf(cf, format!("img {}", i), img.data.as_ref())?;
     }

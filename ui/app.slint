@@ -1,152 +1,156 @@
 import { TabWidget, ListView, StandardTableView, StandardListView, GroupBox, HorizontalBox, TextEdit, VerticalBox, GridBox, ComboBox, Button, ProgressIndicator, Spinner, LineEdit } from "std-widgets.slint";
 
-export global TableViewPageAdapter  {
+export global TableViewPageAdapter {
     in property <[[StandardListViewItem]]> row_data: [
-        [{text:"key1"}, { text:"val1"}],
-        [{text:"key2"}, { text:"val2"}],
-        [{text:"key3"}, { text:"val3"}],
+        [{ text:"key1" }, { text:"val1" }],
+        [{ text:"key2" }, { text:"val2" }],
+        [{ text:"key3" }, { text:"val3" }],
     ];
 }
 
 export global ListViewAdapter {
     in property <[StandardListViewItem]> list_items: [
-        {text: "cf1" },
-        {text: "cf2" },
-        {text: "cf3" },
-        {text: "cf4" },
+        { text: "cf1" },
+        { text: "cf2" },
+        { text: "cf3" },
+        { text: "cf4" },
     ];
 }
 
 export global DbLoader {
-
     pure callback load_db(string);
     pure callback browse_for_db();
-}
-
-export component WelcomeScreen inherits VerticalBox {
-    alignment: center;
-
-    HorizontalBox {
-        path_input:= LineEdit {
-        }
-        Button {
-            text: "Load";
-            checked: false;
-            max-width: 56px;
-            clicked => { DbLoader.load_db(path_input.text); }
-        }
-    }
-
-    HorizontalBox {
-        alignment: center;
-        Button {
-            text: "Browse…";
-            clicked => { DbLoader.browse_for_db(); }
-        }
-    }
-
-    // TODO man I want drag and drop so hard
 }
 
 export component AppWindow inherits Window {
     default-font-family: "Consolas"; // No idea how to change font specifically for one TextEdit. I need this to render blobs in hex.
     default-font-size: 16px;
     title: "rdbv";
-    preferred-width: 960px;
+    preferred-width: 980px;
     preferred-height: 720px;
-
-    // TODO probably should create a custom component for view and do this callback there
-    in property <int> page_index;
     in property <string> db_value_preview;
     in property <string> status_msg;
-    property <string> current_cf; // feels like workaround
-    property <string> current_key;
-    property <string> current_formatting;
+    in property <string> loaded_db_path;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string);
-
-    if page_index == 0 : WelcomeScreen{
-        max-width: 512px;
+    function get_current_cf() -> string {
+        return ListViewAdapter.list_items[column_families.current-item].text;
     }
-    if page_index == 1 :
-    HorizontalBox {
+    function get_current_key() -> string {
+        return TableViewPageAdapter.row_data[kv.current-row][0].text;
+    }
+    VerticalBox {
+        HorizontalBox {
+            VerticalBox {
+                GroupBox {
+                    title: "Column family";
 
-        // I really wanted to have Tabs here, but slint does not support dynamic TabWidget - Tabs must be static
-        GroupBox {
-            title: "Column family";
-
-            // TODO probably make these dependent on column family name text length - hopefully possible in slint
-            min-width: 128px;
-            max-width: 256px;
-            StandardListView {
-                model: ListViewAdapter.list_items;
-                current-item-changed(current-item) => {
-                    let new_cf = ListViewAdapter.list_items[current-item].text;
-                    change_column_family(new_cf);
-                    current_cf = new_cf;
-                }
-            }
-        }
-
-        VerticalLayout {
-
-            StandardTableView {
-                columns: [
-                            { title: @tr("key") },
-                            { title: @tr("value") },
-                        ];
-
-                rows: TableViewPageAdapter.row_data;
-
-                current-row-changed(current-row) => {
-                    let key = TableViewPageAdapter.row_data[current-row][0].text;
-                    current_key = key;
-                    change_db_value_preview(current_cf, current_key, current_formatting);
-                }
-            }
-
-            GroupBox {
-                title: "Preview";
-                VerticalLayout {
-                    LineEdit {
-                        height: 46px;
-                        preferred-height: 46px;
-                        read-only: true;
-                        text: current_key;
-                        enabled: !current_key.is-empty;
-                    }
-                    TextEdit {
-                        min-height: 64px;
-                        read-only: true;
-                        text: db_value_preview;
-                        enabled: !current_key.is-empty;
+                    // TODO probably make these dependent on column family name text length - hopefully possible in slint
+                    min-width: 128px;
+                    max-width: 256px;
+                    column_families := StandardListView {
+                        model: ListViewAdapter.list_items;
+                        current-item-changed(current-item) => {
+                            let new_cf = ListViewAdapter.list_items[current-item].text;
+                            change_column_family(new_cf);
+                            kv.current-row = -1;
+                        }
                     }
                 }
+
+                VerticalBox {
+                    alignment: center;
+                    HorizontalBox {
+                        path_input := LineEdit {
+                            text: "db path";
+                            accepted(text) => { DbLoader.load_db(text); }
+                         }
+
+                        Button {
+                            text: "Load";
+                            checked: false;
+                            max-width: 56px;
+                            clicked => {
+                                DbLoader.load_db(path_input.text);
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        alignment: center;
+                        Button {
+                            text: "Browse…";
+                            clicked => {
+                                DbLoader.browse_for_db();
+                            }
+                        }
+                    }
+
+                    // TODO man I want drag and drop so hard
+                }
             }
 
-            HorizontalBox {
-                Text {
-                    text: status_msg;
-                    vertical-alignment: center;
+            VerticalLayout {
+                kv := StandardTableView {
+                    columns: [
+                        { title: @tr("key") },
+                        { title: @tr("value") },
+                    ];
+                    rows: TableViewPageAdapter.row_data;
+                    current-row-changed(current-row) => {
+                        let key = TableViewPageAdapter.row_data[current-row][0].text;
+                        change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                    }
+                }
+
+                GroupBox {
+                    title: "Preview";
+                    VerticalLayout {
+                        LineEdit {
+                            height: 46px;
+                            preferred-height: 46px;
+                            read-only: true;
+                            text: get_current_key();
+                            enabled: !get_current_key().is-empty;
+                        }
+
+                        preview:= TextEdit {
+                            min-height: 64px;
+                            read-only: true;
+                            text: db_value_preview;
+                            enabled: !get_current_key().is-empty;
+                        }
+                    }
                 }
 
                 HorizontalBox {
-                    alignment: end;
                     Text {
+                        text: status_msg;
                         vertical-alignment: center;
-                        text: "Format";
                     }
-                    ComboBox {
-                        model: ["None", "json", "hex"];
-                        max-width: 24px;
-                        init => { current_formatting = "None" }
-                        selected(current-value) => {
-                            current_formatting = current-value;
-                            change_db_value_preview(current_cf, current_key, current_formatting);
+
+                    HorizontalBox {
+                        alignment: end;
+                        Text {
+                            vertical-alignment: center;
+                            text: "Format";
+                        }
+
+                        formatting := ComboBox {
+                            model: ["None", "json", "hex"];
+                            max-width: 24px;
+                            selected(current-value) => {
+                                change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                            }
                         }
                     }
                 }
             }
+        }
+
+        Text {
+            text: loaded_db_path;
+            opacity: 0.25;
         }
     }
 }
