@@ -152,12 +152,11 @@ impl RdbData {
             println!("Duration: {:?}", duration);
         }
         let opts = rocksdb::Options::default();
-        const PATH: &str = "temp_base";
 
-        let cf_names = rocksdb::DB::list_cf(&opts, path)?;
+        let cf_names = rocksdb::DB::list_cf(&opts, &path)?;
 
         let error_if_log_file_exists = false; // should be true, but fucking rocks does not clean up itself properly
-        let db = rocksdb::DB::open_cf_for_read_only(&opts, PATH, &cf_names, error_if_log_file_exists)?;
+        let db = rocksdb::DB::open_cf_for_read_only(&opts, &path, &cf_names, error_if_log_file_exists)?;
 
         Ok(Self {
             cf_names,
