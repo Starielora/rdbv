@@ -11,7 +11,9 @@ struct Assets;
 const COLUMN_FAMILIES: [&'static str; 3] = ["CF1", "CF2", "CF3"];
 
 fn setup_column_families(db: &mut rocksdb::DB) -> Result<(), rocksdb::Error> {
-    let opts = rocksdb::Options::default();
+    let mut opts = rocksdb::Options::default();
+    opts.set_enable_blob_files(true);
+    opts.set_min_blob_size(64);
 
     for name in COLUMN_FAMILIES {
         db.create_cf(name, &opts)?;
@@ -65,7 +67,12 @@ fn put_scan_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), roc
 
     let img = Assets::get("20251020200239_1.jpg").unwrap();
     for i in 0..1024 {
-        db.put_cf(cf, format!("img {}", i), img.data.as_ref())?;
+        let mut val = Vec::with_capacity(img.data.len());
+        for _ in 0..10 {
+            val.extend_from_slice(img.data.as_ref());
+        }
+        db.put_cf(cf, format!("img {}", i), val.as_slice().as_ref())?;
+        // db.put_cf(cf, format!("img {}", i), img.data.as_ref())?;
     }
 
     Ok(())
@@ -93,6 +100,8 @@ fn main() -> Result<(), rocksdb::Error> {
 
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
+    opts.set_enable_blob_files(true);
+    opts.set_min_blob_size(64);
     let mut db = rocksdb::DB::open(&opts, "temp_base")?;
 
     setup_column_families(&mut db)?;

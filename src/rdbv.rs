@@ -11,13 +11,13 @@ slint::include_modules!();
 use scopeguard::defer;
 
 trait SlintDataSrc {
-    fn get_kv(&self, cf_name: &str) -> VecModel<slint::ModelRc<StandardListViewItem>>;
+    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>>;
     fn get_cfs(&self) -> VecModel<StandardListViewItem>;
 }
 
 struct NullData{}
 impl SlintDataSrc for NullData {
-    fn get_kv(&self, _cf_name: &str) -> VecModel<ModelRc<StandardListViewItem>> {
+    fn get_kv(&self, _cf_name: &str, _query_values: bool) -> VecModel<ModelRc<StandardListViewItem>> {
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
         row_data
     }
@@ -184,7 +184,7 @@ impl RdbData {
 }
 
 impl SlintDataSrc for RdbData {
-    fn get_kv(&self, cf_name: &str) -> VecModel<slint::ModelRc<StandardListViewItem>> {
+    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -197,23 +197,35 @@ impl SlintDataSrc for RdbData {
 
         println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
 
-        let mut it = db.raw_iterator_cf(cf_handle);
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_async_io(true);
+        opts.set_pin_data(true);
+        opts.fill_cache(false);
+        opts.set_allow_unprepared_value(true);
+        let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
         it.seek_to_first();
 
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
         while it.valid() {
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
-            let val = it.value().unwrap();
-
-            let val_str = format_val(&val, Formatting::None(64)).unwrap();
-
             let items = Rc::new(VecModel::default());
             items.push(key.into());
-            items.push(val_str.as_str().into());
+
+            // TODO possibly different loop variant to not check each iteration, although branch predictor should handle it
+            if query_values {
+                it.prepare_value();
+                let val = it.value().unwrap();
+                let val_str = format_val(&val, Formatting::None(64)).unwrap();
+                items.push(val_str.as_str().into());
+            } else {
+                items.push("".into());
+            }
 
             row_data.push(items.into());
 
+            let t = Instant::now();
             it.next();
+            println!("Query time {:?}", t.elapsed());
         }
 
         row_data
@@ -235,7 +247,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
 
-    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
     ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
 
     let ui_handle = ui.as_weak();
@@ -266,13 +278,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
-    ui.on_change_column_family(move |new_cf|{
+    ui.on_change_column_family(move |new_cf, query_values|{
         if new_cf.is_empty() {
             return;
         }
         let ui = ui_handle.unwrap();
         let start = Instant::now();
-        let data = rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str());
+        let data = rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str(), query_values);
         let duration = start.elapsed();
         ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
         ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
@@ -296,7 +308,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         *db = Some(new_data_src);
 
         let src = db.as_ref().unwrap();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("")).into());
+        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
         ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
         ui.set_status_msg(format!("Db open time: {:?}", duration).into());
         ui.set_loaded_db_path(path.into());

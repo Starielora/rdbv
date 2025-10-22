@@ -1,0 +1,30 @@
+This software uses a modified version of RocksDB and rust-rocksdb exposing unprepared values in iterators to allow fast querying of keys, and querying values on demand.
+
+RocksDB changes:
+Source modifications: Starielora, 22.10.2025
+Changes concern trivially exposing iterator unprepared values of RocksDB C interface:
+c.h:
+- added extern ROCKSDB_LIBRARY_API bool rocksdb_iter_prepare_value(rocksdb_iterator_t*);
+- added extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_allow_unprepared_value(rocksdb_readoptions_t*, bool);
+
+c.cc:
+- added trivial implementation of rocksdb_iter_prepare_value(rocksdb_iterator_t*)
+- added trivial implementation of rocksdb_readoptions_set_allow_unprepared_value(rocksdb_readoptions_t*, bool)
+
+rust-rocksdb changes:
+Source modifications: Starielora, 22.10.2025
+Changes concern trivially exposing iterator unprepared values of RocksDB C interface:
+
+src\db_options.rs:
+trivial implementation of ReadOptions::set_allow_unprepared_value:
+    pub fn set_allow_unprepared_value(&mut self, v: bool) {
+        unsafe {
+            ffi::rocksdb_readoptions_set_allow_unprepared_value(self.inner, bool::from(v));
+        }
+    }
+
+src\db_iterator.rs:
+trivial implementation of DBRawIteratorWithThreadMode::prepare_value:
+    pub fn prepare_value(&self) -> bool {
+        unsafe { return ffi::rocksdb_iter_prepare_value(self.inner.as_ptr()); }
+    }

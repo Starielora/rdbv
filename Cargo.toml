@@ -16,7 +16,7 @@ name = "rdbv"
 path = "src/rdbv.rs"
 
 [dependencies]
-rocksdb = "0.24.0"
+rocksdb = { path="rust-rocksdb" }
 scopeguard = "1.2.0"
 slint = "1.13.1"
 rust-embed = "8.8.0"

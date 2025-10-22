@@ -1,7 +1,13 @@
-import { TabWidget, ListView, StandardTableView, StandardListView, GroupBox, HorizontalBox, TextEdit, VerticalBox, GridBox, ComboBox, Button, ProgressIndicator, Spinner, LineEdit } from "std-widgets.slint";
+import { TabWidget, ListView, StandardTableView, StandardListView, GroupBox, HorizontalBox, TextEdit, VerticalBox, GridBox, ComboBox, Button, ProgressIndicator, Spinner, LineEdit, Switch } from "std-widgets.slint";
 
 export global TableViewPageAdapter {
     in property <[[StandardListViewItem]]> row_data: [
+        [{ text:"key1" }, { text:"val1" }],
+        [{ text:"key2" }, { text:"val2" }],
+        [{ text:"key3" }, { text:"val3" }],
+        [{ text:"key1" }, { text:"val1" }],
+        [{ text:"key2" }, { text:"val2" }],
+        [{ text:"key3" }, { text:"val3" }],
         [{ text:"key1" }, { text:"val1" }],
         [{ text:"key2" }, { text:"val2" }],
         [{ text:"key3" }, { text:"val3" }],
@@ -32,7 +38,7 @@ export component AppWindow inherits Window {
     in property <string> status_msg;
     in property <string> loaded_db_path;
     callback change_db_value_preview(string, string, string);
-    callback change_column_family(string);
+    callback change_column_family(string, bool);
     function get_current_cf() -> string {
         return ListViewAdapter.list_items[column_families.current-item].text;
     }
@@ -52,45 +58,51 @@ export component AppWindow inherits Window {
                         model: ListViewAdapter.list_items;
                         current-item-changed(current-item) => {
                             let new_cf = ListViewAdapter.list_items[current-item].text;
-                            change_column_family(new_cf);
+                            change_column_family(new_cf, query_values.checked);
                             kv.current-row = -1;
                         }
                     }
                 }
 
-                VerticalBox {
-                    alignment: center;
-                    HorizontalBox {
-                        path_input := LineEdit {
-                            text: "db path";
-                            accepted(text) => { DbLoader.load_db(text); }
-                         }
-
-                        Button {
-                            text: "Load";
-                            checked: false;
-                            max-width: 56px;
-                            clicked => {
-                                DbLoader.load_db(path_input.text);
-                            }
-                        }
-                    }
-
-                    HorizontalBox {
-                        alignment: center;
-                        Button {
-                            text: "Browse…";
-                            clicked => {
-                                DbLoader.browse_for_db();
-                            }
-                        }
-                    }
-
-                    // TODO man I want drag and drop so hard
-                }
             }
 
             VerticalLayout {
+                spacing: 5px;
+                HorizontalLayout {
+                    HorizontalLayout {
+                        spacing: 5px;
+                        alignment: start;
+                            Button {
+                                text: "Browse…";
+                                clicked => {
+                                    DbLoader.browse_for_db();
+                                }
+                            }
+                            path_input := LineEdit {
+                                text: "db path";
+                                accepted(text) => { DbLoader.load_db(text); }
+                            }
+
+                            Button {
+                                text: "Load";
+                                checked: false;
+                                max-width: 56px;
+                                clicked => {
+                                    DbLoader.load_db(path_input.text);
+                                }
+                            }
+
+                        // TODO man I want drag and drop so hard
+                    }
+                    HorizontalLayout {
+                    alignment: end;
+                    query_values:= Switch {
+                        text: "Query values";
+                        checked: true;
+                    }
+                    }
+                }
+
                 kv := StandardTableView {
                     columns: [
                         { title: @tr("key") },
