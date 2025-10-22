@@ -1,4 +1,21 @@
-import { TabWidget, ListView, StandardTableView, StandardListView, GroupBox, HorizontalBox, TextEdit, VerticalBox, GridBox, ComboBox, Button, ProgressIndicator, Spinner, LineEdit, Switch } from "std-widgets.slint";
+import {
+    TabWidget,
+    ListView,
+    StandardTableView,
+    StandardListView,
+    GroupBox,
+    HorizontalBox,
+    TextEdit,
+    VerticalBox,
+    GridBox,
+    ComboBox,
+    Button,
+    ProgressIndicator,
+    Spinner,
+    LineEdit,
+    Switch,
+    StandardButton,
+} from "std-widgets.slint";
 
 export global TableViewPageAdapter {
     in property <[[StandardListViewItem]]> row_data: [
@@ -26,6 +43,42 @@ export global ListViewAdapter {
 export global DbLoader {
     pure callback load_db(string);
     pure callback browse_for_db();
+    pure callback export_value_to_file(string, string);
+}
+
+export component FullValuePreview inherits Window {
+    in property <string> full_value;
+    in property <string> current_cf;
+    in property <string> current_key;
+    VerticalBox {
+        te := TextEdit {
+            init => {
+                self.focus();
+            }
+            read-only: true;
+            text: full_value;
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 5px;
+            Button {
+                text: "Export…";
+                clicked => {
+                    DbLoader.export_value_to_file(current_cf, current_key);
+                }
+            }
+
+            Button {
+                text: "Copy";
+                clicked => {
+                    te.select-all();
+                    te.copy();
+                    te.clear-selection();
+                }
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -35,16 +88,36 @@ export component AppWindow inherits Window {
     preferred-width: 980px;
     preferred-height: 720px;
     in property <string> db_value_preview;
+    in property <string> db_full_value_preview;
     in property <string> status_msg;
     in property <string> loaded_db_path;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
+    callback change_db_value_full_view(string, string, string);
     function get_current_cf() -> string {
         return ListViewAdapter.list_items[column_families.current-item].text;
     }
     function get_current_key() -> string {
         return TableViewPageAdapter.row_data[kv.current-row][0].text;
     }
+    full_value_popup := PopupWindow {
+        full_value_preview := FullValuePreview {
+            height: 100%;
+            width: 100%;
+            opacity: 98%;
+            full_value: db_full_value_preview;
+            current_cf: get_current_cf();
+            current_key: get_current_key();
+        }
+
+        x: parent.x + 40px;
+        y: parent.y + 40px;
+        height: parent.height - 80px;
+        width: parent.width - 80px;
+        opacity: 100%;
+        close-policy: close-on-click-outside;
+    }
+
     VerticalBox {
         HorizontalBox {
             VerticalBox {
@@ -63,7 +136,6 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-
             }
 
             VerticalLayout {
@@ -72,34 +144,38 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 5px;
                         alignment: start;
-                            Button {
-                                text: "Browse…";
-                                clicked => {
-                                    DbLoader.browse_for_db();
-                                }
+                        Button {
+                            text: "Browse…";
+                            clicked => {
+                                DbLoader.browse_for_db();
                             }
-                            path_input := LineEdit {
-                                text: "db path";
-                                accepted(text) => { DbLoader.load_db(text); }
-                            }
+                        }
 
-                            Button {
-                                text: "Load";
-                                checked: false;
-                                max-width: 56px;
-                                clicked => {
-                                    DbLoader.load_db(path_input.text);
-                                }
+                        path_input := LineEdit {
+                            text: "db path";
+                            accepted(text) => {
+                                DbLoader.load_db(text);
                             }
+                        }
+
+                        Button {
+                            text: "Load";
+                            checked: false;
+                            max-width: 56px;
+                            clicked => {
+                                DbLoader.load_db(path_input.text);
+                            }
+                        }
 
                         // TODO man I want drag and drop so hard
                     }
+
                     HorizontalLayout {
-                    alignment: end;
-                    query_values:= Switch {
-                        text: "Query values";
-                        checked: true;
-                    }
+                        alignment: end;
+                        query_values := Switch {
+                            text: "Query values";
+                            checked: true;
+                        }
                     }
                 }
 
@@ -126,7 +202,7 @@ export component AppWindow inherits Window {
                             enabled: !get_current_key().is-empty;
                         }
 
-                        preview:= TextEdit {
+                        preview := TextEdit {
                             min-height: 64px;
                             read-only: true;
                             text: db_value_preview;
@@ -153,6 +229,24 @@ export component AppWindow inherits Window {
                             max-width: 24px;
                             selected(current-value) => {
                                 change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                            }
+                        }
+
+                        // TODO this is so jank, but I'm so tired rn
+                        ComboBox {
+                            model: ["Value…", "Export", "Full preview"];
+                            selected(current-value) => {
+                                self.current-index = 0;
+                                if get_current_cf().is-empty || get_current_key().is-empty {
+                                    return;
+                                }
+                                if current-value == "Export" {
+                                    DbLoader.export_value_to_file(get_current_cf(), get_current_key());
+                                } else if current-value == "Full preview" {
+                                    change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
+                                    full_value_popup.show();
+                                } else {
+                                }
                             }
                         }
                     }

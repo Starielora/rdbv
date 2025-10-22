@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::io::Write;
 use std::{cell::RefCell, error::Error};
 use std::rc::Rc;
 use std::time::Instant;
@@ -130,7 +131,7 @@ fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Erro
         Err(_) => { // treat as a blob, bro
 
             let mut result = match formatting {
-                Formatting::None(_) => Ok(format_ascii(val)),
+                Formatting::None(_) => Ok(String::from_utf8_lossy(val).into_owned()),
                 Formatting::Json() => Err("Nah bro, can't format as json"),
                 Formatting::Hex(_) => Ok(format_hex_ascii(val)),
             }?;
@@ -179,8 +180,23 @@ impl RdbData {
         }
         let v = v.unwrap();
         format_val(&v, formatting)
+        // Ok(String::from_utf8_lossy(&v).to_string())
     }
 
+    pub fn get_raw_val(&self, cf_name: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Value query time: {:?}", duration);
+        }
+
+        let cf_handle = self.db.cf_handle(cf_name).unwrap();
+        let v = self.db.get_pinned_cf(cf_handle, key)?;
+        if v.is_none() {
+            Err(format!("Failed to get pinned value for key {:?}", key))?
+        }
+        Ok(v.unwrap().to_vec())
+    }
 }
 
 impl SlintDataSrc for RdbData {
@@ -329,6 +345,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             Some(path) => {
                 let path = path.into_os_string().into_string().unwrap();
                 open_db(path, &ui_handle, &rdb_data_src_handle);
+            },
+            None => {},
+        }
+    });
+
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_handle = rdb_data_src.clone();
+    // TODO shares most code with preview
+    ui.on_change_db_value_full_view(move |cf, key, ui_formatting|{
+        if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
+            return;
+        }
+
+        let ui = ui_handle.unwrap();
+        let start = Instant::now();
+        ui.set_db_full_value_preview("".into());
+        // TODO fucking string contract
+        let formatting = match ui_formatting.as_str() {
+            "None" => Formatting::None(usize::MAX),
+            "json" => Formatting::Json(),
+            "hex" => Formatting::Hex(usize::MAX),
+            _ => Formatting::None(usize::MAX)
+        };
+        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
+            Ok(val) => {
+                ui.set_db_full_value_preview(val.into());
+                ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
+            }
+            Err(e) => ui.set_status_msg(e.to_string().into()),
+        }
+    });
+
+    let ui_handle = ui.as_weak();
+    let rdb_data_src_handle = rdb_data_src.clone();
+    ui.global::<DbLoader>().on_export_value_to_file(move |cf, key|{
+        let file = rfd::FileDialog::new().set_directory("./").save_file();
+
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Duration: {:?}", duration);
+        }
+
+        let ui = ui_handle.unwrap();
+        // TODO wtf is this match shit, fix
+        match file {
+            Some(path) => {
+                match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_raw_val(cf.as_str(), key.as_str()) {
+                    Ok(buffer) => {
+                        match std::fs::File::create_new(path) {
+                            Ok(mut file) => {
+                                match file.write(&buffer.as_slice()) {
+                                    Ok(_) => {
+                                        ui.set_status_msg(format!("Write time {:?}", start.elapsed()).into());
+                                    }
+                                    Err(e) => ui.set_status_msg(e.to_string().into()),
+                                }
+                            },
+                            Err(e) => ui.set_status_msg(e.to_string().into()),
+                        }
+                    },
+                    Err(e) => ui.set_status_msg(e.to_string().into()),
+                }
             },
             None => {},
         }
