@@ -14,7 +14,7 @@ import {
     Spinner,
     LineEdit,
     Switch,
-    StandardButton,
+    StandardButton, AboutSlint,
 } from "std-widgets.slint";
 
 export global TableViewPageAdapter {
@@ -84,13 +84,19 @@ export component FullValuePreview inherits Window {
 export component AppWindow inherits Window {
     default-font-family: "Consolas"; // No idea how to change font specifically for one TextEdit. I need this to render blobs in hex.
     default-font-size: 16px;
-    title: "rdbv";
+    title: window_name;
     preferred-width: 980px;
     preferred-height: 720px;
     in property <string> db_value_preview;
     in property <string> db_full_value_preview;
     in property <string> status_msg;
     in property <string> loaded_db_path;
+    in property <string> work_in_progress_name;
+    in property <bool> work_in_progress;
+    in property <float> work_progress;
+    in property <bool> progress_is_indeterminate;
+    in property <string> notice_text;
+    in property <string> window_name;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
     callback change_db_value_full_view(string, string, string);
@@ -118,9 +124,64 @@ export component AppWindow inherits Window {
         close-policy: close-on-click-outside;
     }
 
+    about_popup := PopupWindow {
+        x: parent.x + parent.width * 10%;
+        y: parent.y + parent.height * 10%;
+        height: parent.height - parent.height * 20%;
+        width: parent.width - parent.width * 20%;
+        opacity: 100%;
+        close-policy: close-on-click-outside;
+        Window {
+            height: 100%;
+            width: 100%;
+            opacity: 98%;
+            VerticalLayout {
+                TextEdit {
+                    init => {
+                        self.focus();
+                    }
+                    read-only: true;
+                    text: notice_text;
+                    visible: true;
+                    enabled: false;
+                    height: 75%;
+                }
+                AboutSlint {
+                    opacity: 98%;
+                }
+            }
+        }
+    }
+
     VerticalBox {
         HorizontalBox {
             VerticalBox {
+                        Button {
+                            text: "Browse…";
+                            clicked => {
+                                DbLoader.browse_for_db();
+                            }
+                        }
+                    HorizontalLayout {
+                        spacing: 5px;
+
+                        path_input := LineEdit {
+                            text: "db path";
+                            accepted(text) => {
+                                DbLoader.load_db(text);
+                            }
+                        }
+
+                        Button {
+                            text: "Load";
+                            // max-width: 56px;
+                            clicked => {
+                                DbLoader.load_db(path_input.text);
+                            }
+                        }
+
+                        // TODO man I want drag and drop so hard
+                    }
                 GroupBox {
                     title: "Column family";
 
@@ -136,38 +197,21 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                Button {
+                    text: "About";
+                    clicked => {
+                        about_popup.show()
+                    }
+                }
             }
 
             VerticalLayout {
                 spacing: 5px;
                 HorizontalLayout {
-                    HorizontalLayout {
-                        spacing: 5px;
-                        alignment: start;
-                        Button {
-                            text: "Browse…";
-                            clicked => {
-                                DbLoader.browse_for_db();
-                            }
-                        }
-
-                        path_input := LineEdit {
-                            text: "db path";
-                            accepted(text) => {
-                                DbLoader.load_db(text);
-                            }
-                        }
-
-                        Button {
-                            text: "Load";
-                            checked: false;
-                            max-width: 56px;
-                            clicked => {
-                                DbLoader.load_db(path_input.text);
-                            }
-                        }
-
-                        // TODO man I want drag and drop so hard
+                    Text {
+                        text: loaded_db_path;
+                        opacity: 0.25;
                     }
 
                     HorizontalLayout {
@@ -175,6 +219,20 @@ export component AppWindow inherits Window {
                         query_values := Switch {
                             text: "Query values";
                             checked: true;
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    VerticalLayout {
+                        Text {
+                            text: work_in_progress_name;
+                            visible: work_in_progress;
+                        }
+                        ProgressIndicator {
+                            visible: work_in_progress;
+                            progress: work_progress;
+                            indeterminate: progress_is_indeterminate;
                         }
                     }
                 }
@@ -215,37 +273,41 @@ export component AppWindow inherits Window {
                     Text {
                         text: status_msg;
                         vertical-alignment: center;
+                        wrap: TextWrap.char-wrap;
                     }
 
-                    HorizontalBox {
-                        alignment: end;
-                        Text {
-                            vertical-alignment: center;
-                            text: "Format";
-                        }
-
-                        formatting := ComboBox {
-                            model: ["None", "json", "hex"];
-                            max-width: 24px;
-                            selected(current-value) => {
-                                change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                    VerticalLayout {
+                        alignment: LayoutAlignment.start;
+                        HorizontalBox {
+                            alignment: end;
+                            Text {
+                                vertical-alignment: center;
+                                text: "Format";
                             }
-                        }
 
-                        // TODO this is so jank, but I'm so tired rn
-                        ComboBox {
-                            model: ["Value…", "Export", "Full preview"];
-                            selected(current-value) => {
-                                self.current-index = 0;
-                                if get_current_cf().is-empty || get_current_key().is-empty {
-                                    return;
+                            formatting := ComboBox {
+                                model: ["None", "json", "hex"];
+                                max-width: 24px;
+                                selected(current-value) => {
+                                    change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
                                 }
-                                if current-value == "Export" {
-                                    DbLoader.export_value_to_file(get_current_cf(), get_current_key());
-                                } else if current-value == "Full preview" {
-                                    change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
-                                    full_value_popup.show();
-                                } else {
+                            }
+
+                            // TODO this is so jank, but I'm so tired rn
+                            ComboBox {
+                                model: ["Value…", "Export", "Full preview"];
+                                selected(current-value) => {
+                                    self.current-index = 0;
+                                    if get_current_cf().is-empty || get_current_key().is-empty {
+                                        return;
+                                    }
+                                    if current-value == "Export" {
+                                        DbLoader.export_value_to_file(get_current_cf(), get_current_key());
+                                    } else if current-value == "Full preview" {
+                                        change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
+                                        full_value_popup.show();
+                                    } else {
+                                    }
                                 }
                             }
                         }
@@ -254,9 +316,5 @@ export component AppWindow inherits Window {
             }
         }
 
-        Text {
-            text: loaded_db_path;
-            opacity: 0.25;
-        }
     }
 }

@@ -1,34 +1,27 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Write;
-use std::{cell::RefCell, error::Error};
+use std::ops::Add;
+use std::sync::atomic::AtomicBool;
+use std::error::Error;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use slint::{ModelRc, StandardListViewItem, VecModel};
+use slint::{ComponentHandle, Model, StandardListViewItem, VecModel};
 
 slint::include_modules!();
 
 use scopeguard::defer;
 
-trait SlintDataSrc {
-    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>>;
-    fn get_cfs(&self) -> VecModel<StandardListViewItem>;
-}
+use crate::worker::WorkerThread;
 
-struct NullData{}
-impl SlintDataSrc for NullData {
-    fn get_kv(&self, _cf_name: &str, _query_values: bool) -> VecModel<ModelRc<StandardListViewItem>> {
-        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
-        row_data
-    }
+mod worker;
 
-    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
-        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-        cf_data
-    }
-}
+use std::panic;
+use windows_sys::{core::*, Win32::UI::Shell::*, Win32::UI::WindowsAndMessaging::*};
 
+#[derive(Clone, Copy)]
 enum Formatting {
     None(usize),
     Json(),
@@ -42,16 +35,7 @@ struct RdbData{
 
 fn format_ascii_u8(v: u8) -> char
 {
-    if !v.is_ascii_graphic() { '.' } else { char::from_u32((v).into()).unwrap() }
-}
-
-fn format_ascii(val: &[u8]) -> String {
-
-    let mut result = String::new();
-    for c in val {
-        result.push(format_ascii_u8(*c));
-    }
-    result
+    if !v.is_ascii_graphic() { '.' } else { v as char }
 }
 
 // TODO This must be slow af, pls fix
@@ -103,9 +87,13 @@ fn format_hex_ascii(val: &[u8]) -> String {
 fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Error>>
 {
     let (val, was_cut) = match formatting {
-        Formatting::None(max_chars) => (val.get(..usize::min(max_chars, val.len())).unwrap(), val.len() > max_chars),
+        Formatting::None(max_chars) | Formatting::Hex(max_chars) => {
+            let range = usize::min(max_chars, val.len());
+            let val = val.get(..range).ok_or(format!("Invalid subslice range. Tried to get [0..{}], but slice has len {}", range, val.len()).to_string())?;
+            let was_cut = val.len() > max_chars;
+            (val, was_cut)
+        },
         Formatting::Json() => (val, false), // assume json formatting always parses full json
-        Formatting::Hex(max_chars) => (val.get(..usize::min(max_chars, val.len())).unwrap(), val.len() > max_chars),
     };
 
     match std::str::from_utf8(val) {
@@ -166,52 +154,42 @@ impl RdbData {
     }
 
     pub fn get_val(&self, cf_name: &str, key: &str, formatting: Formatting) -> Result<String, Box<dyn Error>> {
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Value query time: {:?}", duration);
-        }
-
-        println!("Query: {:?}", key);
-        let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_pinned_cf(cf_handle, key)?;
-        if v.is_none() {
-            Err(format!("Failed to get pinned value for key {:?}", key))?
-        }
-        let v = v.unwrap();
+        let v = self.get_raw_val(cf_name, key)?;
         format_val(&v, formatting)
-        // Ok(String::from_utf8_lossy(&v).to_string())
+    }
+
+    fn get_cf_handle(&self, cf_name: &str) -> Result<&rocksdb::ColumnFamily, Box<dyn Error>> {
+        Ok(self.db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?) // Fails only if UI passess different string - should I expect validity and crash app otherwise?
     }
 
     pub fn get_raw_val(&self, cf_name: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
-            println!("Value query time: {:?}", duration);
+            println!("Value query time for {}: {:?}", key, duration);
         }
 
-        let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_pinned_cf(cf_handle, key)?;
-        if v.is_none() {
-            Err(format!("Failed to get pinned value for key {:?}", key))?
-        }
-        Ok(v.unwrap().to_vec())
+        let cf_handle = self.get_cf_handle(cf_name)?;
+        Ok(self.db.get_pinned_cf(cf_handle, key)?.ok_or(format!("No value found for key {:?}", key))?.to_vec())
     }
-}
 
-impl SlintDataSrc for RdbData {
-    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>> {
+    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, set_progress_indeterminate: Box<dyn Fn()>, cancel: &AtomicBool) -> Result<Vec<String>, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
-            println!("Column family {} query time: {:?}", cf_name, duration);
+            println!("Column family {} keys query time: {:?}", cf_name, duration);
         }
 
         let db = &self.db;
 
-        let cf_handle = db.cf_handle(cf_name).unwrap();
+        let cf_handle = self.get_cf_handle(cf_name)?;
 
-        println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
+        let est_keys_num = if let Ok(Some(est_keys_num)) = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys") {
+            est_keys_num
+        } else {
+            set_progress_indeterminate();
+            0
+        };
 
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_async_io(true);
@@ -221,199 +199,461 @@ impl SlintDataSrc for RdbData {
         let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
         it.seek_to_first();
 
-        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+        let mut keys = Vec::new();
+
+        let mut actual_keys_num = 0;
         while it.valid() {
-            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
-            let items = Rc::new(VecModel::default());
-            items.push(key.into());
-
-            // TODO possibly different loop variant to not check each iteration, although branch predictor should handle it
-            if query_values {
-                it.prepare_value();
-                let val = it.value().unwrap();
-                let val_str = format_val(&val, Formatting::None(64)).unwrap();
-                items.push(val_str.as_str().into());
-            } else {
-                items.push("".into());
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
             }
-
-            row_data.push(items.into());
-
             let t = Instant::now();
+            let key = std::str::from_utf8(it.key().expect("Database invalid iterator access."))?; // This shouldn't fail, as iterator is validated as loop condition
+
+            keys.push(key.to_string());
+
+            println!("Query time {:?}. Key: {}", t.elapsed(), key);
             it.next();
-            println!("Query time {:?}", t.elapsed());
+            actual_keys_num += 1;
+            progress_report(actual_keys_num as f32 / est_keys_num as f32);
         }
 
-        row_data
-    }
-
-    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
-        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-
-        for cf in &self.cf_names {
-            cf_data.push(cf.as_str().into());
-        }
-
-        cf_data
+        Ok(keys)
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let ui = AppWindow::new()?;
-
-    let rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
-
-    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
-    ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.on_change_db_value_preview(move |cf, key, ui_formatting| {
-        if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
-            return;
+// TODO customize further, check upgrade_in_event_loop result
+macro_rules! toggle_progress_bar {
+    ($ui_handle:expr, $op_name:expr, $is_indeterminate:ident, $show:ident) => {{
+        let ui_handle = $ui_handle.clone();
+        move |_cancel| {
+            let op_name = $op_name.clone();
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                ui.set_progress_is_indeterminate($is_indeterminate);
+                ui.set_work_in_progress_name(op_name.into());
+                ui.set_work_in_progress($show);
+            });
         }
+    }};
+}
 
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
-        ui.set_db_value_preview("".into());
-        // TODO fucking string contract
-        let formatting = match ui_formatting.as_str() {
-            "None" => Formatting::None(2048),
-            "json" => Formatting::Json(),
-            "hex" => Formatting::Hex(2048),
-            _ => Formatting::None(2048)
-        };
-        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
-            Ok(val) => {
-                ui.set_db_value_preview(val.into());
-                ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
-            }
-            Err(e) => ui.set_status_msg(e.to_string().into()),
-        }
-    });
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.on_change_column_family(move |new_cf, query_values|{
-        if new_cf.is_empty() {
-            return;
-        }
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
-        let data = rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str(), query_values);
-        let duration = start.elapsed();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
-        ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
-    });
-
-    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Rc<RefCell<Option<RdbData>>>| {
-
-        let ui = ui_handle.unwrap();
-        println!("{:?}", path.as_str());
-        let mut db = rdb_data_src_handle.borrow_mut();
-        let start = Instant::now();
-        let db_open_result = RdbData::new(path.to_string());
-
-        if db_open_result.is_err() {
-            println!("{}", db_open_result.err().unwrap().into_string());
-            return;
-        }
-
-        let new_data_src = db_open_result.unwrap();
-        let duration = start.elapsed();
-        *db = Some(new_data_src);
-
-        let src = db.as_ref().unwrap();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
-        ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
-        ui.set_status_msg(format!("Db open time: {:?}", duration).into());
-        ui.set_loaded_db_path(path.into());
+macro_rules! show_indeterminate_progress_bar {
+    ($ui_handle:expr, $op_name:expr) => {
+        toggle_progress_bar!($ui_handle, $op_name, true, true)
     };
+}
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.global::<DbLoader>().on_load_db(move |path| {
-        open_db(path.to_string(), &ui_handle, &rdb_data_src_handle);
-    });
+macro_rules! hide_progress_bar {
+    ($ui_handle:expr) => {
+        toggle_progress_bar!($ui_handle, "", false, false)
+    };
+}
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.global::<DbLoader>().on_browse_for_db(move ||{
-        let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
+fn db_value_preview_handler(ui: &AppWindow, rdb: &RdbData,cf: &str, key: &str, formatting: Formatting, full_view: bool) {
+    debug_assert!(!cf.is_empty());
+    debug_assert!(!key.is_empty());
 
-        match folder {
-            Some(path) => {
-                let path = path.into_os_string().into_string().unwrap();
-                open_db(path, &ui_handle, &rdb_data_src_handle);
-            },
-            None => {},
-        }
-    });
+    let start = Instant::now();
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    // TODO shares most code with preview
-    ui.on_change_db_value_full_view(move |cf, key, ui_formatting|{
-        if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
-            return;
-        }
-
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
+    if full_view {
         ui.set_db_full_value_preview("".into());
-        // TODO fucking string contract
-        let formatting = match ui_formatting.as_str() {
-            "None" => Formatting::None(usize::MAX),
-            "json" => Formatting::Json(),
-            "hex" => Formatting::Hex(usize::MAX),
-            _ => Formatting::None(usize::MAX)
-        };
-        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
-            Ok(val) => {
+    }
+    else {
+        ui.set_db_value_preview("".into());
+    }
+
+    match rdb.get_val(cf, key, formatting) {
+        Ok(val) => {
+            if full_view {
                 ui.set_db_full_value_preview(val.into());
-                ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
+            } else {
+                ui.set_db_value_preview(val.into());
             }
-            Err(e) => ui.set_status_msg(e.to_string().into()),
+            ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
+        }
+        Err(e) => ui.set_status_msg(e.to_string().into()),
+    }
+}
+
+fn open_db(path: String, ui_handle: &slint::Weak<AppWindow>, rdb_handle: &Arc<Mutex<Option<RdbData>>>, worker: &WorkerThread) {
+    println!("{:?}", path.as_str());
+
+    let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+    let progress_bar_title = format!("Opening {:?}", path);
+    tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle, progress_bar_title)));
+
+    let ui_clone = ui_handle.clone();
+    let rdb_handle = rdb_handle.clone();
+    tasks.push(Box::new(
+        move |_cancel| {
+            let start = Instant::now();
+            match RdbData::new(path.to_string()) {
+                Ok(rdb) => {
+                    let duration = start.elapsed();
+                    let cf_names = rdb.cf_names.clone();
+
+                    {
+                        match rdb_handle.lock() {
+                            Ok(mut rdb_guard) => {
+                                *rdb_guard = Some(rdb);
+                            }
+                            Err(_) => {
+                                // main thread crashed, nothing more to do here
+                                return;
+                            }
+                        }
+                    }
+
+                    let path_clone = path.clone();
+                    let _ = ui_clone.upgrade_in_event_loop(move |handle|{
+
+                        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
+                        for cf in cf_names.iter() {
+                            cf_data.push(cf.as_str().into());
+                        }
+
+                        handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+                        handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
+                        handle.set_status_msg(format!("Db open time: {:?}", duration).into());
+                        handle.set_loaded_db_path(path_clone.into());
+                    }).map_err(print_stderr);
+                },
+                Err(err) => {
+                    let _ = ui_clone.upgrade_in_event_loop(move |ui| {
+                        ui.set_status_msg(err.to_string().into());
+                    });
+                },
+            }
+
+        }
+    ));
+
+    tasks.push(Box::new(hide_progress_bar!(ui_handle)));
+
+    worker.push_tasks(tasks);
+}
+
+fn get_formatting(ui_formatting: &str, chars_num: usize) -> Formatting {
+    match ui_formatting {
+        "None" => Formatting::None(chars_num),
+        "json" => Formatting::Json(),
+        "hex" => Formatting::Hex(chars_num),
+        _ => todo!("Unknown formatting value from UI."),
+    }
+}
+
+fn print_stderr(err: slint::EventLoopError) {
+    eprintln!("{:?}", err);
+}
+
+macro_rules! lock_db {
+    ($handle:ident, $guard:ident, $rdb:ident) => {
+        // TODO potentially try to revive worker thread? The rdb reference should work fine as there's only read access.
+        let $guard = $handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+        let $rdb = $guard.as_ref().expect("Value preview handler called without database loaded");
+    };
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+
+    let ui = AppWindow::new()?;
+    let critical_error_occurred: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Option::None));
+
+    panic::set_hook(Box::new({
+        let ui = ui.as_weak();
+        let critical_error_occured = critical_error_occurred.clone();
+        move |panic_info| {
+        let msg = format!("{panic_info}");
+
+        {
+            // if this lock fails then no msg will be printed and app exit code will be 0. 
+            // Should I fix this with an AtomicBool or sth, or is this failure impossible?
+            if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
+                *critical_error_guard = Some(msg.clone());
+            }
+        }
+
+        let _ = ui.upgrade_in_event_loop(|ui| {
+            ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
+        });
+
+        unsafe {
+            ShellMessageBoxA(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                msg.as_ptr(),
+                s!("Critical error"),
+                MB_ICONERROR,
+            );
+        }
+    }}));
+
+
+    let notice_text = include_bytes!("../NOTICE");
+    ui.set_notice_text(std::str::from_utf8(notice_text)?.into());
+    ui.set_window_name(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).into());
+
+    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+    ui.global::<ListViewAdapter>().set_list_items(Rc::new(VecModel::default()).into());
+
+    let worker = Arc::new(worker::WorkerThread::new());
+    let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
+
+    ui.global::<DbLoader>().on_load_db({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+        move |path| {
+            open_db(path.to_string(), &ui_handle, &rdb_handle, &worker);
         }
     });
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.global::<DbLoader>().on_export_value_to_file(move |cf, key|{
-        let file = rfd::FileDialog::new().set_directory("./").save_file();
+    ui.global::<DbLoader>().on_browse_for_db({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
 
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Duration: {:?}", duration);
+        move ||{
+            let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
+
+            if let Some(path) = folder {
+                let path = path.into_os_string().into_string().expect("Got string which is inconvertible to UTF-8 from folder picker."); // No idea if folder picker can return me an invalid string.
+                open_db(path, &ui_handle, &rdb_handle, &worker);
+            }
         }
+    });
 
-        let ui = ui_handle.unwrap();
-        // TODO wtf is this match shit, fix
-        match file {
-            Some(path) => {
-                match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_raw_val(cf.as_str(), key.as_str()) {
-                    Ok(buffer) => {
-                        match std::fs::File::create_new(path) {
-                            Ok(mut file) => {
-                                match file.write(&buffer.as_slice()) {
-                                    Ok(_) => {
-                                        ui.set_status_msg(format!("Write time {:?}", start.elapsed()).into());
-                                    }
-                                    Err(e) => ui.set_status_msg(e.to_string().into()),
-                                }
-                            },
-                            Err(e) => ui.set_status_msg(e.to_string().into()),
+    ui.on_change_db_value_preview({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+
+        move |cf, key, ui_formatting| {
+
+            if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
+                return;
+            }
+
+            let formatting = get_formatting(ui_formatting.as_str(), 2048);
+
+            // fast enough to not do it on a separate thread... at least for now
+            if let Some(ui) = ui_handle.upgrade() {
+                lock_db!(rdb_handle, guard, rdb);
+                db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
+            }
+        }
+    });
+
+    // TODO shares most code with preview
+    // TODO move to background thread
+    ui.on_change_db_value_full_view({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+
+        move |cf, key, ui_formatting|{
+
+            if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
+                return;
+            }
+
+            let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
+
+            if let Some(ui) = ui_handle.upgrade() {
+                lock_db!(rdb_handle, guard, rdb);
+                db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, true);
+            }
+        }
+    });
+
+    ui.on_change_column_family({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+        move |cf, query_values|{
+            if cf.is_empty() {
+                return;
+            }
+
+            worker.cancel_currently_scheduled_work();
+
+            let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+
+            tasks.push(
+                Box::new({
+                let ui = ui_handle.clone();
+                let rdb_handle = rdb_handle.clone();
+                move |cancel| {
+
+                    let ui_handle = ui.clone();
+                    let rdb_handle = rdb_handle.clone();
+                    let cf = cf.clone();
+                    let result = move || -> Result<(), Box<dyn Error>> {
+                        let progress_bar_title = format!("Loading keys of {}", cf.as_str());
+                        let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                            ui.set_progress_is_indeterminate(false);
+                            ui.set_work_in_progress_name(progress_bar_title.into());
+                            ui.set_work_in_progress(true);
+                        }).map_err(print_stderr);
+
+                        let progress_report = Box::new({
+                            let ui = ui_handle.clone();
+                            move |progress: f32| {
+                                let _ = ui.upgrade_in_event_loop(move |handle|{
+                                    handle.set_work_progress(progress);
+                                }).map_err(print_stderr);
+                            }
+                        });
+
+                        let set_progres_indeterminate = Box::new({
+                            let ui = ui_handle.clone();
+                            move || {
+                                let _ = ui.upgrade_in_event_loop(move |handle|{
+                                    handle.set_progress_is_indeterminate(true);
+                                }).map_err(print_stderr);
+                            }
+                        });
+
+                        let start = Instant::now();
+                        let keys = {
+                            lock_db!(rdb_handle, guard, rdb);
+                            rdb.get_keys(cf.as_str(), progress_report, set_progres_indeterminate, cancel)?
+                        };
+                        let duration = start.elapsed();
+
+                        // TODO could preallocate this vec when getting keys instead of copying
+                        // For now perf is sufficient
+                        let mut row_data: Vec<(String, String)> = Vec::new();
+                        for k in keys.iter() {
+                            row_data.push((k.to_string(), "".to_string()));
                         }
-                    },
-                    Err(e) => ui.set_status_msg(e.to_string().into()),
+
+                        let _ = ui_handle.upgrade_in_event_loop({
+                            let cf = cf.clone();
+                            move |handle|{
+                                let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+
+                                // VecModel is not Send and cannot be prepared on second thread.
+                                for (k, v) in row_data.iter() {
+                                    let items = Rc::new(VecModel::default());
+                                    items.push(k.as_str().into());
+                                    items.push(v.as_str().into());
+                                    ui_row_data.push(items.into());
+                                }
+
+                                handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
+                                handle.set_status_msg(format!("{} CF keys query time: {:?}", cf, duration).into());
+                                handle.set_work_in_progress(false);
+                            }
+                        }).map_err(print_stderr);
+
+                        if query_values {
+
+                            let ui = ui_handle.clone();
+                            let _ = ui.upgrade_in_event_loop(move |handle|{
+                                handle.set_work_progress(0.0);
+                                handle.set_work_in_progress(true);
+                            }).map_err(print_stderr);
+
+                            let cf = cf.clone();
+                            let mut total_values_query_time = Duration::new(0, 0);
+                            for (i, key) in keys.iter().enumerate() {
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                let progress_bar_title = format!("Loading {}", key);
+                                let _ = ui.upgrade_in_event_loop(move |ui| {
+                                    ui.set_work_in_progress_name(progress_bar_title.into());
+                                }).map_err(print_stderr);
+
+                                let start = Instant::now();
+                                let value = {
+                                    lock_db!(rdb_handle, guard, rdb);
+                                    rdb.get_val(cf.as_ref(), key, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string()
+                                };
+
+                                total_values_query_time = total_values_query_time.add(start.elapsed());
+
+                                let _ = ui.upgrade_in_event_loop({
+                                    let progress = i as f32 / keys.len() as f32;
+                                    move |handle|{
+                                        handle.global::<TableViewPageAdapter>()
+                                            .get_row_data()
+                                            .row_data(i)
+                                            .expect(format!("Failed to get {} row of KV Table", i).as_str()) // shouldn't fail as the table was preallocated with keys, which are reused here to populate values
+                                            .set_row_data(1, value.as_str().into());
+                                        handle.set_work_progress(progress);
+                                    }
+                                }).map_err(print_stderr);
+                            }
+
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
+                                ui.set_work_in_progress(false);
+                            }).map_err(print_stderr);
+                        }
+                        Ok(())
+                    };
+
+                    match result() {
+                        Ok(_) => {},
+                        Err(err) => {
+                            let msg = format!("{}", err.to_string());
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_status_msg(msg.as_str().into());
+                            });
+                        },
+                    }
+
+            }}));
+
+            worker.push_tasks(tasks);
+        }
+    });
+
+    ui.global::<DbLoader>().on_export_value_to_file({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+
+        move |cf, key|{
+            let file = rfd::FileDialog::new().set_directory("./").save_file();
+
+            let start = Instant::now();
+            defer!{
+                let duration = start.elapsed();
+                println!("Duration: {:?}", duration);
+            }
+
+            if let Some(ui) = ui_handle.upgrade() {
+                lock_db!(rdb_handle, guard, rdb);
+
+                if let Some(file) = file {
+                    let _ = || -> Result<(), Box<dyn Error>> {
+                        let buffer = rdb.get_raw_val(cf.as_str(), key.as_str())?;
+                        std::fs::File::create_new(file)?.write(&buffer.as_slice())?;
+                        Ok(())
+                    }().map_err(|e| {
+                        ui.set_status_msg(e.to_string().into());
+                    });
                 }
-            },
-            None => {},
+            }
         }
     });
 
     ui.run()?;
+
+    match critical_error_occurred.lock() {
+        Ok(mut msg_opt) => {
+            if let Some(msg) = (*msg_opt).take() {
+                Err(msg)?
+            }
+        },
+        Err(mut err) => {
+            // best effort at retrieving msg?
+            // does it even make sense? it would mean that panic handler panicked while holding this mtx
+            if let Some(msg) = (*err.get_mut()).take() {
+                Err(msg)?
+            }
+        },
+    };
 
     Ok(())
 }
