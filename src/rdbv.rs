@@ -1,8 +1,10 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::{cell::RefCell, error::Error};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use slint::{ModelRc, StandardListViewItem, VecModel};
@@ -197,6 +199,54 @@ impl RdbData {
         }
         Ok(v.unwrap().to_vec())
     }
+
+    pub fn get_kv_raw(&self, cf_name: &str, query_values: bool) -> Vec<(String, String)> {
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Column family {} query time: {:?}", cf_name, duration);
+        }
+
+        let db = &self.db;
+
+        let cf_handle = db.cf_handle(cf_name).unwrap();
+
+        println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
+
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_async_io(true);
+        opts.set_pin_data(true);
+        opts.fill_cache(false);
+        opts.set_allow_unprepared_value(true);
+        let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
+        it.seek_to_first();
+
+        let mut row_data = Vec::new();
+
+        while it.valid() {
+            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
+            let mut final_val = String::from("");
+
+            // TODO possibly different loop variant to not check each iteration, although branch predictor should handle it
+            if query_values {
+                it.prepare_value();
+                let val = it.value().unwrap();
+                let val_str = format_val(&val, Formatting::None(64)).unwrap();
+                final_val = val_str;
+            } else {
+                final_val = String::from("");
+            }
+
+            row_data.push((key.to_string(), final_val));
+
+            let t = Instant::now();
+            it.next();
+            println!("Query time {:?}", t.elapsed());
+        }
+
+        row_data
+
+    }
 }
 
 impl SlintDataSrc for RdbData {
@@ -259,9 +309,41 @@ impl SlintDataSrc for RdbData {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+
+    let shutdown_thread = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let ui = AppWindow::new()?;
 
-    let rdb_data_src: Rc<RefCell<Option<RdbData>>> = Rc::new(RefCell::new(None));
+    let werker_thread_tasks: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(Vec::new()));
+    let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
+
+    let worker_thread = std::thread::spawn({
+        let shutdown = shutdown_thread.clone();
+        let tasks = werker_thread_tasks.clone();
+        let rdb = rdb_data_src.clone();
+        move || {
+            let (mtx, cvar) = &*shutdown;
+            println!("Worker thread is ready for werk");
+            while true {
+                println!("Waiting for werk");
+                let shutdown = cvar.wait(mtx.lock().unwrap()).unwrap();
+
+                let tasks = &mut *tasks.lock().unwrap();
+
+                for task in tasks.iter() {
+                    task();
+                }
+
+                tasks.clear();
+
+                if *shutdown {
+                    println!("No more werk. Bye");
+                    break;
+                }
+
+                println!("Doing werk");
+            }
+    }});
+
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
     ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
@@ -283,7 +365,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "hex" => Formatting::Hex(2048),
             _ => Formatting::None(2048)
         };
-        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
+        match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
             Ok(val) => {
                 ui.set_db_value_preview(val.into());
                 ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
@@ -294,23 +376,57 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
+    let tasks_clone = werker_thread_tasks.clone();
+    let stclone = shutdown_thread.clone();
     ui.on_change_column_family(move |new_cf, query_values|{
         if new_cf.is_empty() {
             return;
         }
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
-        let data = rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_kv(new_cf.as_str(), query_values);
-        let duration = start.elapsed();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
-        ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
+
+        let (thread_mtx, cvar) = &*stclone;
+        let mut tasks = &mut *tasks_clone.lock().unwrap();
+        let ui_handle = ui_handle.clone();
+        let rdb_data_src_handle = rdb_data_src_handle.clone();
+        tasks.push(
+            Box::new(
+            move || {
+                let start = Instant::now();
+                let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv_raw(new_cf.as_str(), query_values);
+                let duration = start.elapsed();
+                let new_cf = new_cf.clone();
+                let ui = ui_handle.upgrade_in_event_loop(move |handle|{
+                    let start = Instant::now();
+                    let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+
+                    for (k,v) in data {
+                        let items = Rc::new(VecModel::default());
+                        items.push(k.as_str().into());
+                        items.push(v.as_str().into());
+                        row_data.push(items.into());
+                    }
+                    let model_time = start.elapsed();
+                    println!("Model copy time: {:?}", model_time);
+
+                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(row_data).into());
+                    handle.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
+                });
+        }));
+        cvar.notify_one();
+
+        // let ui = ui_handle.unwrap();
+        // let start = Instant::now();
+        // let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv(new_cf.as_str(), query_values);
+        // let duration = start.elapsed();
+        // ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
+        // ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
+
     });
 
-    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Rc<RefCell<Option<RdbData>>>| {
+    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Arc<Mutex<Option<RdbData>>>| {
 
         let ui = ui_handle.unwrap();
         println!("{:?}", path.as_str());
-        let mut db = rdb_data_src_handle.borrow_mut();
+        let mut db = &mut *rdb_data_src_handle.lock().unwrap();
         let start = Instant::now();
         let db_open_result = RdbData::new(path.to_string());
 
@@ -368,7 +484,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "hex" => Formatting::Hex(usize::MAX),
             _ => Formatting::None(usize::MAX)
         };
-        match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
+        match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
             Ok(val) => {
                 ui.set_db_full_value_preview(val.into());
                 ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
@@ -392,7 +508,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // TODO wtf is this match shit, fix
         match file {
             Some(path) => {
-                match rdb_data_src_handle.borrow().as_ref().as_ref().unwrap().get_raw_val(cf.as_str(), key.as_str()) {
+                match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_raw_val(cf.as_str(), key.as_str()) {
                     Ok(buffer) => {
                         match std::fs::File::create_new(path) {
                             Ok(mut file) => {
@@ -414,6 +530,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     ui.run()?;
+
+    {
+        let (thread_mtx, cvar) = &*shutdown_thread;
+
+        let mut tasks = &mut *werker_thread_tasks.lock().unwrap();
+        let rdb = rdb_data_src.clone();
+        tasks.push(
+            Box::new(
+            move || {
+            let val = rdb.lock().unwrap().as_ref().as_ref().unwrap().get_val("CF1", "CF1_k3", Formatting::None(1e6 as usize)).unwrap();
+            println!("Werk1 val: {}", val);
+        }));
+
+        cvar.notify_one();
+    }
+    {
+        let (thread_mtx, cvar) = &*shutdown_thread;
+
+        let mut tasks = &mut *werker_thread_tasks.lock().unwrap();
+        let rdb = rdb_data_src.clone();
+        tasks.push(Box::new(move || {
+            let val = rdb.lock().unwrap().as_ref().as_ref().unwrap().get_val("CF1", "json formatted", Formatting::None(1e6 as usize)).unwrap();
+            println!("Werk2 val: {}", val);
+        }));
+
+        cvar.notify_one();
+    }
+    {
+        let (thread_mtx, cvar) = &*shutdown_thread;
+        *thread_mtx.lock().unwrap() = true;
+        cvar.notify_one();
+    }
+    worker_thread.join().unwrap();
 
     Ok(())
 }
