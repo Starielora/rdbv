@@ -13,6 +13,8 @@ slint::include_modules!();
 
 use scopeguard::defer;
 
+mod worker;
+
 trait SlintDataSrc {
     fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>>;
     fn get_cfs(&self) -> VecModel<StandardListViewItem>;
@@ -310,40 +312,10 @@ impl SlintDataSrc for RdbData {
 
 fn main() -> Result<(), Box<dyn Error>> {
 
-    let shutdown_thread = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let ui = AppWindow::new()?;
 
-    let werker_thread_tasks: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(Vec::new()));
+    let werker = Arc::new(worker::WorkerThread::new());
     let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
-
-    let worker_thread = std::thread::spawn({
-        let shutdown = shutdown_thread.clone();
-        let tasks = werker_thread_tasks.clone();
-        let rdb = rdb_data_src.clone();
-        move || {
-            let (mtx, cvar) = &*shutdown;
-            println!("Worker thread is ready for werk");
-            while true {
-                println!("Waiting for werk");
-                let shutdown = cvar.wait(mtx.lock().unwrap()).unwrap();
-
-                let tasks = &mut *tasks.lock().unwrap();
-
-                for task in tasks.iter() {
-                    task();
-                }
-
-                tasks.clear();
-
-                if *shutdown {
-                    println!("No more werk. Bye");
-                    break;
-                }
-
-                println!("Doing werk");
-            }
-    }});
-
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
     ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
@@ -376,17 +348,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
-    let tasks_clone = werker_thread_tasks.clone();
-    let stclone = shutdown_thread.clone();
+    let werker_clone = werker.clone();
     ui.on_change_column_family(move |new_cf, query_values|{
         if new_cf.is_empty() {
             return;
         }
 
-        let (thread_mtx, cvar) = &*stclone;
-        let mut tasks = &mut *tasks_clone.lock().unwrap();
         let ui_handle = ui_handle.clone();
         let rdb_data_src_handle = rdb_data_src_handle.clone();
+        let mut tasks: Vec<Box<dyn Fn() + Send>> = Vec::new();
         tasks.push(
             Box::new(
             move || {
@@ -411,15 +381,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     handle.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
                 });
         }));
-        cvar.notify_one();
 
-        // let ui = ui_handle.unwrap();
-        // let start = Instant::now();
-        // let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv(new_cf.as_str(), query_values);
-        // let duration = start.elapsed();
-        // ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(data).into());
-        // ui.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
-
+        werker_clone.push_tasks(tasks);
     });
 
     let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Arc<Mutex<Option<RdbData>>>| {
@@ -530,39 +493,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     ui.run()?;
-
-    {
-        let (thread_mtx, cvar) = &*shutdown_thread;
-
-        let mut tasks = &mut *werker_thread_tasks.lock().unwrap();
-        let rdb = rdb_data_src.clone();
-        tasks.push(
-            Box::new(
-            move || {
-            let val = rdb.lock().unwrap().as_ref().as_ref().unwrap().get_val("CF1", "CF1_k3", Formatting::None(1e6 as usize)).unwrap();
-            println!("Werk1 val: {}", val);
-        }));
-
-        cvar.notify_one();
-    }
-    {
-        let (thread_mtx, cvar) = &*shutdown_thread;
-
-        let mut tasks = &mut *werker_thread_tasks.lock().unwrap();
-        let rdb = rdb_data_src.clone();
-        tasks.push(Box::new(move || {
-            let val = rdb.lock().unwrap().as_ref().as_ref().unwrap().get_val("CF1", "json formatted", Formatting::None(1e6 as usize)).unwrap();
-            println!("Werk2 val: {}", val);
-        }));
-
-        cvar.notify_one();
-    }
-    {
-        let (thread_mtx, cvar) = &*shutdown_thread;
-        *thread_mtx.lock().unwrap() = true;
-        cvar.notify_one();
-    }
-    worker_thread.join().unwrap();
 
     Ok(())
 }
