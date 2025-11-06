@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
 use std::{cell::RefCell, error::Error};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,8 @@ use slint::{ModelRc, StandardListViewItem, VecModel};
 slint::include_modules!();
 
 use scopeguard::defer;
+
+use crate::worker::WorkerThread;
 
 mod worker;
 
@@ -202,7 +205,7 @@ impl RdbData {
         Ok(v.unwrap().to_vec())
     }
 
-    pub fn get_kv_raw(&self, cf_name: &str, query_values: bool) -> Vec<(String, String)> {
+    pub fn get_kv_raw(&self, cf_name: &str, query_values: bool, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Vec<(String, String)> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -225,7 +228,13 @@ impl RdbData {
 
         let mut row_data = Vec::new();
 
+        let est_keys = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys").unwrap().unwrap();
+        let mut actual_keys_num = 0;
         while it.valid() {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let t = Instant::now();
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
             let mut final_val = String::from("");
 
@@ -241,13 +250,20 @@ impl RdbData {
 
             row_data.push((key.to_string(), final_val));
 
-            let t = Instant::now();
+            println!("Query time {:?}. Key: {}", t.elapsed(), key);
             it.next();
-            println!("Query time {:?}", t.elapsed());
+            actual_keys_num += 1;
+            progress_report(actual_keys_num as f32 / est_keys as f32);
         }
+
+        println!("keys: {}; actual: {}", est_keys, actual_keys_num);
 
         row_data
 
+    }
+
+    pub fn get_cfs_raw(&self) -> &Vec<String> {
+        &self.cf_names
     }
 }
 
@@ -275,6 +291,7 @@ impl SlintDataSrc for RdbData {
 
         let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
         while it.valid() {
+            let t = Instant::now();
             let key = std::str::from_utf8(it.key().unwrap()).unwrap();
             let items = Rc::new(VecModel::default());
             items.push(key.into());
@@ -291,9 +308,8 @@ impl SlintDataSrc for RdbData {
 
             row_data.push(items.into());
 
-            let t = Instant::now();
+            println!("Query time {:?}. Key: {}", t.elapsed(), key);
             it.next();
-            println!("Query time {:?}", t.elapsed());
         }
 
         row_data
@@ -308,6 +324,36 @@ impl SlintDataSrc for RdbData {
 
         cf_data
     }
+}
+
+macro_rules! toggle_progress_bar {
+    ($ui_handle:expr, $is_indeterminate:expr, $show:expr) => {{
+        let ui_handle = $ui_handle.clone();
+        move |cancel| {
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                ui.set_progress_is_indeterminate($is_indeterminate);
+                ui.set_work_in_progress($show);
+            });
+        }
+    }};
+}
+
+macro_rules! show_progress_bar {
+    ($ui_handle:expr) => {
+        toggle_progress_bar!($ui_handle, false, true)
+    };
+}
+
+macro_rules! show_indeterminate_progress_bar {
+    ($ui_handle:expr) => {
+        toggle_progress_bar!($ui_handle, true, true)
+    };
+}
+
+macro_rules! hide_progress_bar {
+    ($ui_handle:expr) => {
+        toggle_progress_bar!($ui_handle, false, false)
+    };
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -354,17 +400,28 @@ fn main() -> Result<(), Box<dyn Error>> {
             return;
         }
 
-        let ui_handle = ui_handle.clone();
+        werker_clone.cancel_currently_scheduled_work();
+
         let rdb_data_src_handle = rdb_data_src_handle.clone();
-        let mut tasks: Vec<Box<dyn Fn() + Send>> = Vec::new();
+        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+
+        tasks.push(Box::new(show_progress_bar!(ui_handle)));
+
+        let ui_handle_clone = ui_handle.clone();
         tasks.push(
             Box::new(
-            move || {
+            move |cancel| {
                 let start = Instant::now();
-                let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv_raw(new_cf.as_str(), query_values);
+                let ui2 = ui_handle_clone.clone();
+                let progress_report = Box::new(move |progress: f32| {
+                    let _ = ui2.upgrade_in_event_loop(move |handle|{
+                        handle.set_work_progress(progress);
+                    }).unwrap();
+                });
+                let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv_raw(new_cf.as_str(), query_values, progress_report, cancel);
                 let duration = start.elapsed();
                 let new_cf = new_cf.clone();
-                let ui = ui_handle.upgrade_in_event_loop(move |handle|{
+                let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
                     let start = Instant::now();
                     let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
@@ -379,51 +436,80 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                     handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(row_data).into());
                     handle.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
-                });
+                }).unwrap();
         }));
+
+        tasks.push(Box::new(hide_progress_bar!(ui_handle)));
 
         werker_clone.push_tasks(tasks);
     });
 
-    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Arc<Mutex<Option<RdbData>>>| {
+    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Arc<Mutex<Option<RdbData>>>, werker: &WorkerThread| {
 
-        let ui = ui_handle.unwrap();
         println!("{:?}", path.as_str());
-        let mut db = &mut *rdb_data_src_handle.lock().unwrap();
-        let start = Instant::now();
-        let db_open_result = RdbData::new(path.to_string());
 
-        if db_open_result.is_err() {
-            println!("{}", db_open_result.err().unwrap().into_string());
-            return;
-        }
+        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
-        let new_data_src = db_open_result.unwrap();
-        let duration = start.elapsed();
-        *db = Some(new_data_src);
+        tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle)));
 
-        let src = db.as_ref().unwrap();
-        ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
-        ui.global::<ListViewAdapter>().set_list_items(Rc::new(src.get_cfs()).into());
-        ui.set_status_msg(format!("Db open time: {:?}", duration).into());
-        ui.set_loaded_db_path(path.into());
+        let ui_clone = ui_handle.clone();
+        let rdb_data_src_handle = rdb_data_src_handle.clone();
+        tasks.push(Box::new(
+            move |cancel| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let db = &mut *rdb_data_src_handle.lock().unwrap();
+                let start = Instant::now();
+                let db_open_result = RdbData::new(path.to_string());
+
+                if db_open_result.is_err() {
+                    println!("{}", db_open_result.err().unwrap().into_string());
+                    return;
+                }
+
+                let new_data_src = db_open_result.unwrap();
+                let duration = start.elapsed();
+                *db = Some(new_data_src);
+
+                let src = db.as_ref().unwrap();
+                let cf_names = src.cf_names.clone();
+                let path_clone = path.clone();
+                let _ = ui_clone.upgrade_in_event_loop(move |handle|{
+
+                    let cf_data: VecModel<StandardListViewItem> = VecModel::default();
+                    for cf in cf_names.iter() {
+                        cf_data.push(cf.as_str().into());
+                    }
+
+                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
+                    handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
+                    handle.set_status_msg(format!("Db open time: {:?}", duration).into());
+                    handle.set_loaded_db_path(path_clone.into());
+                });
+            }
+        ));
+
+        tasks.push(Box::new(hide_progress_bar!(ui_handle)));
+
+        werker.push_tasks(tasks);
     };
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
+    let werker_clone = werker.clone();
     ui.global::<DbLoader>().on_load_db(move |path| {
-        open_db(path.to_string(), &ui_handle, &rdb_data_src_handle);
+        open_db(path.to_string(), &ui_handle, &rdb_data_src_handle, &werker_clone);
     });
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
+    let werker_clone = werker.clone();
     ui.global::<DbLoader>().on_browse_for_db(move ||{
         let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
 
         match folder {
             Some(path) => {
                 let path = path.into_os_string().into_string().unwrap();
-                open_db(path, &ui_handle, &rdb_data_src_handle);
+                open_db(path, &ui_handle, &rdb_data_src_handle, &werker_clone);
             },
             None => {},
         }

@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Condvar};
 use std::collections::VecDeque;
 use std::option::Option;
@@ -8,16 +9,16 @@ fn worker_thread_main() {
 pub struct WorkerThread {
     thread_handle: Option<std::thread::JoinHandle<()>>,
     wakeup: Arc<(Mutex<bool>, Condvar)>,
-    tasks: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>>,
-    cancel: Arc<Mutex<bool>>,
+    tasks: Arc<Mutex<Vec<Box<dyn Fn(&AtomicBool) + Send>>>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl WorkerThread {
     pub fn new() -> WorkerThread {
 
         let wakeup = Arc::new((Mutex::new(false), Condvar::new()));
-        let tasks: Arc<Mutex<Vec<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(Vec::new()));
-        let cancel = Arc::new(Mutex::new(false));
+        let tasks: Arc<Mutex<Vec<Box<dyn Fn(&AtomicBool) + Send>>>> = Arc::new(Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let start_barrier = Arc::new(std::sync::Barrier::new(1));
 
@@ -44,17 +45,17 @@ impl WorkerThread {
 
                     println!("Doing werk");
 
-                    *cancel.lock().unwrap() = false;
+                    cancel.store(false, std::sync::atomic::Ordering::Release);
 
                     let tasks = &mut *tasks.lock().unwrap();
 
                     for task in tasks.iter() {
-                        let cancelled = *cancel.lock().unwrap();
+                        let cancelled = cancel.load(std::sync::atomic::Ordering::Acquire);
                         if cancelled {
                             break;
                         }
                         else {
-                            task();
+                            task(&*cancel);
                         }
                     }
 
@@ -73,7 +74,7 @@ impl WorkerThread {
         }
     }
 
-    pub fn push_tasks(&self, mut user_tasks: Vec<Box<dyn Fn() + Send>>) {
+    pub fn push_tasks(&self, mut user_tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>>) {
         let tasks = &mut *self.tasks.lock().unwrap();
         tasks.append(&mut user_tasks);
 
@@ -81,7 +82,7 @@ impl WorkerThread {
     }
 
     pub fn cancel_currently_scheduled_work(&self) {
-        *self.cancel.lock().unwrap() = true;
+        self.cancel.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
