@@ -124,6 +124,32 @@ export component AppWindow inherits Window {
     VerticalBox {
         HorizontalBox {
             VerticalBox {
+                        Button {
+                            text: "Browse…";
+                            clicked => {
+                                DbLoader.browse_for_db();
+                            }
+                        }
+                    HorizontalLayout {
+                        spacing: 5px;
+
+                        path_input := LineEdit {
+                            text: "db path";
+                            accepted(text) => {
+                                DbLoader.load_db(text);
+                            }
+                        }
+
+                        Button {
+                            text: "Load";
+                            // max-width: 56px;
+                            clicked => {
+                                DbLoader.load_db(path_input.text);
+                            }
+                        }
+
+                        // TODO man I want drag and drop so hard
+                    }
                 GroupBox {
                     title: "Column family";
 
@@ -139,38 +165,18 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                Button {
+                    text: "About";
+                }
             }
 
             VerticalLayout {
                 spacing: 5px;
                 HorizontalLayout {
-                    HorizontalLayout {
-                        spacing: 5px;
-                        alignment: start;
-                        Button {
-                            text: "Browse…";
-                            clicked => {
-                                DbLoader.browse_for_db();
-                            }
-                        }
-
-                        path_input := LineEdit {
-                            text: "db path";
-                            accepted(text) => {
-                                DbLoader.load_db(text);
-                            }
-                        }
-
-                        Button {
-                            text: "Load";
-                            checked: false;
-                            max-width: 56px;
-                            clicked => {
-                                DbLoader.load_db(path_input.text);
-                            }
-                        }
-
-                        // TODO man I want drag and drop so hard
+                    Text {
+                        text: loaded_db_path;
+                        opacity: 0.25;
                     }
 
                     HorizontalLayout {
@@ -265,9 +271,5 @@ export component AppWindow inherits Window {
             }
         }
 
-        Text {
-            text: loaded_db_path;
-            opacity: 0.25;
-        }
     }
 }

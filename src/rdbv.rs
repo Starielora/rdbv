@@ -456,7 +456,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         let rdb_data_src_handle = rdb_data_src_handle.clone();
         tasks.push(Box::new(
             move |cancel| {
-                std::thread::sleep(std::time::Duration::from_secs(5));
                 let db = &mut *rdb_data_src_handle.lock().unwrap();
                 let start = Instant::now();
                 let db_open_result = RdbData::new(path.to_string());

@@ -45,12 +45,12 @@ impl WorkerThread {
 
                     println!("Doing werk");
 
-                    cancel.store(false, std::sync::atomic::Ordering::Release);
+                    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
                     let tasks = &mut *tasks.lock().unwrap();
 
                     for task in tasks.iter() {
-                        let cancelled = cancel.load(std::sync::atomic::Ordering::Acquire);
+                        let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
                         if cancelled {
                             break;
                         }
@@ -82,7 +82,7 @@ impl WorkerThread {
     }
 
     pub fn cancel_currently_scheduled_work(&self) {
-        self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -118,14 +118,14 @@ mod test {
     #[test]
     fn push_work() {
         let werker = WorkerThread::new();
-        let mut tasks: Vec<Box<dyn Fn() + Send>> = Vec::new();
+        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
         let mut w1 = Arc::new(Mutex::new(false));
         let mut w1_cvar = Arc::new(Condvar::new());
 
         let w1_clone = w1.clone(); 
         let w1_cvar_clone = w1_cvar.clone();
-        tasks.push(Box::new(move || {
+        tasks.push(Box::new(move |_cancel| {
             *w1_clone.lock().unwrap() = true;
             w1_cvar_clone.notify_one();
         }));
@@ -135,7 +135,7 @@ mod test {
 
         let w2_clone = w2.clone(); 
         let w2_cvar_clone = w2_cvar.clone();
-        tasks.push(Box::new(move || {
+        tasks.push(Box::new(move |_cancel| {
             *w2_clone.lock().unwrap() = true;
             w2_cvar_clone.notify_one();
         }));
@@ -152,7 +152,7 @@ mod test {
     #[test]
     fn cancel_work() {
         let werker = WorkerThread::new();
-        let mut tasks: Vec<Box<dyn Fn() + Send>> = Vec::new();
+        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
         let mut w1_main_thread = Arc::new((Mutex::new(false), Condvar::new()));
         let mut w1_work_thread = Arc::new((Mutex::new(()), Condvar::new()));
@@ -160,14 +160,14 @@ mod test {
         let w1_main_thread_clone = w1_main_thread.clone(); 
         let w1_work_thread_clone = w1_work_thread.clone();
 
-        tasks.push(Box::new(move || {
+        tasks.push(Box::new(move |_cancel| {
             *w1_main_thread_clone.0.lock().unwrap() = true;
             w1_main_thread_clone.1.notify_one();
 
             let _unused = w1_work_thread_clone.1.wait(w1_main_thread_clone.0.lock().unwrap()).unwrap();
         }));
 
-        tasks.push(Box::new(move || {
+        tasks.push(Box::new(move |_cancel| {
             panic!("This task should not have executed");
         }));
 
