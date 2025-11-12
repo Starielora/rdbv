@@ -1,10 +1,6 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Condvar};
-use std::collections::VecDeque;
 use std::option::Option;
-
-fn worker_thread_main() {
-}
 
 pub struct WorkerThread {
     thread_handle: Option<std::thread::JoinHandle<()>>,
@@ -101,7 +97,7 @@ impl std::ops::Drop for WorkerThread {
         cvar.notify_one();
 
         if let Some(thread) = self.thread_handle.take() {
-            thread.join();
+            thread.join().expect("Failed to join worker thread.");
         }
     }
 }

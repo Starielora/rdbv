@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::ops::Add;
 use std::sync::atomic::AtomicBool;
-use std::{cell::RefCell, error::Error};
+use std::error::Error;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,15 +50,6 @@ struct RdbData{
 fn format_ascii_u8(v: u8) -> char
 {
     if !v.is_ascii_graphic() { '.' } else { char::from_u32((v).into()).unwrap() }
-}
-
-fn format_ascii(val: &[u8]) -> String {
-
-    let mut result = String::new();
-    for c in val {
-        result.push(format_ascii_u8(*c));
-    }
-    result
 }
 
 // TODO This must be slow af, pls fix
@@ -255,67 +246,6 @@ impl RdbData {
         // TODO legit clone?
         val.clone()
     }
-
-    pub fn get_kv_raw(&self, cf_name: &str, query_values: bool, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Vec<(String, String)> {
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Column family {} query time: {:?}", cf_name, duration);
-        }
-
-        let db = &self.db;
-
-        let cf_handle = db.cf_handle(cf_name).unwrap();
-
-        println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
-
-        let mut opts = rocksdb::ReadOptions::default();
-        opts.set_async_io(true);
-        opts.set_pin_data(true);
-        opts.fill_cache(false);
-        opts.set_allow_unprepared_value(true);
-        let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
-        it.seek_to_first();
-
-        let mut row_data = Vec::new();
-
-        let est_keys = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys").unwrap().unwrap();
-        let mut actual_keys_num = 0;
-        while it.valid() {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                break;
-            }
-            let t = Instant::now();
-            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
-            let mut final_val = String::from("");
-
-            // TODO possibly different loop variant to not check each iteration, although branch predictor should handle it
-            if query_values {
-                it.prepare_value();
-                let val = it.value().unwrap();
-                let val_str = format_val(&val, Formatting::None(64)).unwrap();
-                final_val = val_str;
-            } else {
-                final_val = String::from("");
-            }
-
-            row_data.push((key.to_string(), final_val));
-
-            println!("Query time {:?}. Key: {}", t.elapsed(), key);
-            it.next();
-            actual_keys_num += 1;
-            progress_report(actual_keys_num as f32 / est_keys as f32);
-        }
-
-        println!("keys: {}; actual: {}", est_keys, actual_keys_num);
-
-        row_data
-
-    }
-
-    pub fn get_cfs_raw(&self) -> &Vec<String> {
-        &self.cf_names
-    }
 }
 
 impl SlintDataSrc for RdbData {
@@ -380,7 +310,7 @@ impl SlintDataSrc for RdbData {
 macro_rules! toggle_progress_bar {
     ($ui_handle:expr, $op_name:expr, $is_indeterminate:ident, $show:ident) => {{
         let ui_handle = $ui_handle.clone();
-        move |cancel| {
+        move |_cancel| {
             let op_name = $op_name.clone();
             let _ = ui_handle.upgrade_in_event_loop(move |ui| {
                 ui.set_progress_is_indeterminate($is_indeterminate);
@@ -529,7 +459,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         total_values_query_time = total_values_query_time.add(start.elapsed());
                         let progress = i as f32 / keys.len() as f32;
                         let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
-                            let start = Instant::now();
                             handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).unwrap().set_row_data(1, value.as_str().into());
                             handle.set_work_progress(progress);
                         }).unwrap();
@@ -558,7 +487,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let ui_clone = ui_handle.clone();
         let rdb_data_src_handle = rdb_data_src_handle.clone();
         tasks.push(Box::new(
-            move |cancel| {
+            move |_cancel| {
                 let db = &mut *rdb_data_src_handle.lock().unwrap();
                 let start = Instant::now();
                 let db_open_result = RdbData::new(path.to_string());
