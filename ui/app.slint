@@ -84,7 +84,7 @@ export component FullValuePreview inherits Window {
 export component AppWindow inherits Window {
     default-font-family: "Consolas"; // No idea how to change font specifically for one TextEdit. I need this to render blobs in hex.
     default-font-size: 16px;
-    title: "rdbv";
+    title: window_name;
     preferred-width: 980px;
     preferred-height: 720px;
     in property <string> db_value_preview;
@@ -96,6 +96,7 @@ export component AppWindow inherits Window {
     in property <float> work_progress;
     in property <bool> progress_is_indeterminate;
     in property <string> notice_text;
+    in property <string> window_name;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
     callback change_db_value_full_view(string, string, string);
