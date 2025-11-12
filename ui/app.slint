@@ -91,6 +91,7 @@ export component AppWindow inherits Window {
     in property <string> db_full_value_preview;
     in property <string> status_msg;
     in property <string> loaded_db_path;
+    in property <string> work_in_progress_name;
     in property <bool> work_in_progress;
     in property <float> work_progress;
     in property <bool> progress_is_indeterminate;
@@ -189,10 +190,16 @@ export component AppWindow inherits Window {
                 }
 
                 HorizontalBox {
-                    ProgressIndicator {
-                        visible: work_in_progress;
-                        progress: work_progress;
-                        indeterminate: progress_is_indeterminate;
+                    VerticalLayout {
+                        Text {
+                            text: work_in_progress_name;
+                            visible: work_in_progress;
+                        }
+                        ProgressIndicator {
+                            visible: work_in_progress;
+                            progress: work_progress;
+                            indeterminate: progress_is_indeterminate;
+                        }
                     }
                 }
 

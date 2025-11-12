@@ -1,14 +1,14 @@
 // #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::VecDeque;
 use std::io::Write;
+use std::ops::Add;
 use std::sync::atomic::AtomicBool;
 use std::{cell::RefCell, error::Error};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use slint::{ModelRc, StandardListViewItem, VecModel};
+use slint::{Model, ModelRc, StandardListViewItem, VecModel};
 
 slint::include_modules!();
 
@@ -205,6 +205,57 @@ impl RdbData {
         Ok(v.unwrap().to_vec())
     }
 
+    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Vec<String> {
+        let start = Instant::now();
+        defer!{
+            let duration = start.elapsed();
+            println!("Column family {} keys query time: {:?}", cf_name, duration);
+        }
+
+        let db = &self.db;
+
+        let cf_handle = db.cf_handle(cf_name).unwrap();
+
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_async_io(true);
+        opts.set_pin_data(true);
+        opts.fill_cache(false);
+        opts.set_allow_unprepared_value(true);
+        let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
+        it.seek_to_first();
+
+        let mut keys = Vec::new();
+
+        let est_keys_num = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys").unwrap().unwrap();
+        let mut actual_keys_num = 0;
+        while it.valid() {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let t = Instant::now();
+            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
+
+            keys.push(key.to_string());
+
+            println!("Query time {:?}. Key: {}", t.elapsed(), key);
+            it.next();
+            actual_keys_num += 1;
+            progress_report(actual_keys_num as f32 / est_keys_num as f32);
+        }
+
+        println!("keys: {}; actual: {}", est_keys_num, actual_keys_num);
+
+        keys
+    }
+
+    pub fn get_value(&self, cf_name: &str, key: &str) -> Vec<u8> {
+        // TODO unwrap
+        let cf_handle = &self.db.cf_handle(cf_name).unwrap();
+        let val = &self.db.get_cf(cf_handle, key).unwrap().unwrap();
+        // TODO legit clone?
+        val.clone()
+    }
+
     pub fn get_kv_raw(&self, cf_name: &str, query_values: bool, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Vec<(String, String)> {
         let start = Instant::now();
         defer!{
@@ -327,11 +378,13 @@ impl SlintDataSrc for RdbData {
 }
 
 macro_rules! toggle_progress_bar {
-    ($ui_handle:expr, $is_indeterminate:expr, $show:expr) => {{
+    ($ui_handle:expr, $op_name:expr, $is_indeterminate:ident, $show:ident) => {{
         let ui_handle = $ui_handle.clone();
         move |cancel| {
+            let op_name = $op_name.clone();
             let _ = ui_handle.upgrade_in_event_loop(move |ui| {
                 ui.set_progress_is_indeterminate($is_indeterminate);
+                ui.set_work_in_progress_name(op_name.into());
                 ui.set_work_in_progress($show);
             });
         }
@@ -339,20 +392,20 @@ macro_rules! toggle_progress_bar {
 }
 
 macro_rules! show_progress_bar {
-    ($ui_handle:expr) => {
-        toggle_progress_bar!($ui_handle, false, true)
+    ($ui_handle:expr, $op_name:expr) => {
+        toggle_progress_bar!($ui_handle, $op_name, false, true)
     };
 }
 
 macro_rules! show_indeterminate_progress_bar {
-    ($ui_handle:expr) => {
-        toggle_progress_bar!($ui_handle, true, true)
+    ($ui_handle:expr, $op_name:expr) => {
+        toggle_progress_bar!($ui_handle, $op_name, true, true)
     };
 }
 
 macro_rules! hide_progress_bar {
     ($ui_handle:expr) => {
-        toggle_progress_bar!($ui_handle, false, false)
+        toggle_progress_bar!($ui_handle, "", false, false)
     };
 }
 
@@ -405,38 +458,88 @@ fn main() -> Result<(), Box<dyn Error>> {
         let rdb_data_src_handle = rdb_data_src_handle.clone();
         let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
-        tasks.push(Box::new(show_progress_bar!(ui_handle)));
+        let progress_bar_title = format!("Loading column family {}", new_cf.as_str());
+        tasks.push(Box::new(show_progress_bar!(ui_handle, progress_bar_title)));
 
         let ui_handle_clone = ui_handle.clone();
         tasks.push(
             Box::new(
             move |cancel| {
-                let start = Instant::now();
                 let ui2 = ui_handle_clone.clone();
                 let progress_report = Box::new(move |progress: f32| {
                     let _ = ui2.upgrade_in_event_loop(move |handle|{
                         handle.set_work_progress(progress);
                     }).unwrap();
                 });
-                let data = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_kv_raw(new_cf.as_str(), query_values, progress_report, cancel);
-                let duration = start.elapsed();
-                let new_cf = new_cf.clone();
-                let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
-                    let start = Instant::now();
-                    let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
-                    for (k,v) in data {
+                let progress_bar_title = format!("Loading keys of {}", new_cf.as_str());
+                let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
+                    ui.set_progress_is_indeterminate(false);
+                    ui.set_work_in_progress_name(progress_bar_title.into());
+                    ui.set_work_in_progress(true);
+                }).unwrap();
+
+                let start = Instant::now();
+                let keys = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_keys(new_cf.as_str(), progress_report, cancel);
+                let duration = start.elapsed();
+
+                let mut row_data: Vec<(String, String)> = Vec::new();
+
+                for k in keys.iter() {
+                    row_data.push((k.to_string(), "".to_string()));
+                }
+
+                let new_cf_clone = new_cf.clone();
+                let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
+                    let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+
+                    for (k, v) in row_data.iter() {
                         let items = Rc::new(VecModel::default());
                         items.push(k.as_str().into());
                         items.push(v.as_str().into());
-                        row_data.push(items.into());
+                        ui_row_data.push(items.into());
                     }
-                    let model_time = start.elapsed();
-                    println!("Model copy time: {:?}", model_time);
 
-                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(row_data).into());
-                    handle.set_status_msg(format!("{} CF query time: {:?}", new_cf, duration).into());
+                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
+                    handle.set_status_msg(format!("{} CF keys query time: {:?}", new_cf_clone, duration).into());
                 }).unwrap();
+
+                if query_values {
+
+                    let ui_handle_clone = ui_handle_clone.clone();
+                    let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
+                        handle.set_work_progress(0.0);
+                    }).unwrap();
+
+                    let new_cf_clone = new_cf.clone();
+                    let mut total_values_query_time = Duration::new(0, 0);
+                    for (i, key) in keys.iter().enumerate() {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let progress_bar_title = format!("Loading {}", key);
+                        let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
+                            ui.set_work_in_progress_name(progress_bar_title.into());
+                        }).unwrap();
+
+                        let start = Instant::now();
+                        let value = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_value(&new_cf_clone.as_ref(), key);
+                        let value = format_val(&value, Formatting::None(2048)).unwrap().lines().nth(0).unwrap().to_string();
+                        total_values_query_time = total_values_query_time.add(start.elapsed());
+                        let progress = i as f32 / keys.len() as f32;
+                        let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
+                            let start = Instant::now();
+                            handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).unwrap().set_row_data(1, value.as_str().into());
+                            handle.set_work_progress(progress);
+                        }).unwrap();
+                    }
+
+                    let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
+                        ui.set_status_msg(format!("{} values query time: {:?}", new_cf_clone, total_values_query_time).into());
+                    }).unwrap();
+                }
+
         }));
 
         tasks.push(Box::new(hide_progress_bar!(ui_handle)));
@@ -449,8 +552,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("{:?}", path.as_str());
 
         let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
-
-        tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle)));
+        let progress_bar_title = format!("Opening {:?}", path);
+        tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle, progress_bar_title)));
 
         let ui_clone = ui_handle.clone();
         let rdb_data_src_handle = rdb_data_src_handle.clone();
