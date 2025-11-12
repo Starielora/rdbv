@@ -14,7 +14,7 @@ import {
     Spinner,
     LineEdit,
     Switch,
-    StandardButton,
+    StandardButton, AboutSlint,
 } from "std-widgets.slint";
 
 export global TableViewPageAdapter {
@@ -95,6 +95,7 @@ export component AppWindow inherits Window {
     in property <bool> work_in_progress;
     in property <float> work_progress;
     in property <bool> progress_is_indeterminate;
+    in property <string> notice_text;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
     callback change_db_value_full_view(string, string, string);
@@ -120,6 +121,35 @@ export component AppWindow inherits Window {
         width: parent.width - 80px;
         opacity: 100%;
         close-policy: close-on-click-outside;
+    }
+
+    about_popup := PopupWindow {
+        x: parent.x + parent.width * 10%;
+        y: parent.y + parent.height * 10%;
+        height: parent.height - parent.height * 20%;
+        width: parent.width - parent.width * 20%;
+        opacity: 100%;
+        close-policy: close-on-click-outside;
+        Window {
+            height: 100%;
+            width: 100%;
+            opacity: 98%;
+            VerticalLayout {
+                TextEdit {
+                    init => {
+                        self.focus();
+                    }
+                    read-only: true;
+                    text: notice_text;
+                    visible: true;
+                    enabled: false;
+                    height: 75%;
+                }
+                AboutSlint {
+                    opacity: 98%;
+                }
+            }
+        }
     }
 
     VerticalBox {
@@ -169,6 +199,9 @@ export component AppWindow inherits Window {
 
                 Button {
                     text: "About";
+                    clicked => {
+                        about_popup.show()
+                    }
                 }
             }
 

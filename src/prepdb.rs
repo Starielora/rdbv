@@ -1,14 +1,9 @@
 use std::time::Instant;
 
 use scopeguard::defer;
-use rust_embed::Embed;
-
-#[derive(Embed)]
-#[folder = "assets/"]
-struct Assets;
-
 
 const COLUMN_FAMILIES: [&'static str; 3] = ["CF1", "CF2", "CF3"];
+const IMG: [u8; 860888] = *include_bytes!("../assets/20251020200239_1.jpg");
 
 fn setup_column_families(db: &mut rocksdb::DB) -> Result<(), rocksdb::Error> {
     let mut opts = rocksdb::Options::default();
@@ -30,8 +25,7 @@ fn put_job_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), rock
     let text = r#"commonly used names of animals and plants, such as トカゲ (tokage, "lizard"), ネコ (neko, "cat") and バラ (bara, "rose"), and certain other technical and scientific terms, including chemical and mineral names such as カリウム (kariumu, "potassium"), ポリマー (porimā, "polymer") and ベリル (beriru, "beryl")"#;
     db.put_cf(cf, "CF1_k3", text)?;
 
-    let img = Assets::get("20251020200239_1.jpg").unwrap();
-    db.put_cf(cf, "image", img.data.as_ref())?;
+    db.put_cf(cf, "image", IMG)?;
 
     let json = r#"{"name": "John Doe","age": 43,"phones": ["+44 1234567","+44 2345678"]}"#;
     let json2 = r#"
@@ -65,11 +59,10 @@ fn put_scan_shit(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily) -> Result<(), roc
     db.put_cf(cf, "CF3_k2", "CF3_v2")?;
     db.put_cf(cf, "CF3_k3", "CF3_v3")?;
 
-    let img = Assets::get("20251020200239_1.jpg").unwrap();
     for i in 0..1024 {
-        let mut val = Vec::with_capacity(img.data.len());
+        let mut val = Vec::with_capacity(IMG.len());
         for _ in 0..10 {
-            val.extend_from_slice(img.data.as_ref());
+            val.extend_from_slice(&IMG);
         }
         db.put_cf(cf, format!("img {}", i), val.as_slice().as_ref())?;
         // db.put_cf(cf, format!("img {}", i), img.data.as_ref())?;

@@ -680,6 +680,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let notice_text = include_bytes!("../NOTICE");
+    ui.set_notice_text(std::str::from_utf8(notice_text).unwrap().into());
+
     ui.run()?;
 
     Ok(())

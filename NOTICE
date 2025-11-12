@@ -1,4 +1,6 @@
-This software uses a modified version of RocksDB and rust-rocksdb exposing unprepared values in iterators to allow fast querying of keys, and querying values on demand.
+This software uses a modified version of RocksDB and rust-rocksdb, exposing unprepared values in iterators to allow fast querying of keys, and querying values on demand.
+
+RocksDB and rust-rocksdb are under Apache License 2.0.
 
 RocksDB changes:
 Source modifications: Starielora, 22.10.2025
@@ -13,7 +15,7 @@ c.cc:
 
 rust-rocksdb changes:
 Source modifications: Starielora, 22.10.2025
-Changes concern trivially exposing iterator unprepared values of RocksDB C interface:
+Changes concern trivially exposing iterator unprepared values of modified RocksDB C interface:
 
 src\db_options.rs:
 trivial implementation of ReadOptions::set_allow_unprepared_value:
