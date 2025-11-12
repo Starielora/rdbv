@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slint::{Model, ModelRc, StandardListViewItem, VecModel};
+use slint::{Model, StandardListViewItem, VecModel};
 
 slint::include_modules!();
 
@@ -17,24 +17,6 @@ use scopeguard::defer;
 use crate::worker::WorkerThread;
 
 mod worker;
-
-trait SlintDataSrc {
-    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>>;
-    fn get_cfs(&self) -> VecModel<StandardListViewItem>;
-}
-
-struct NullData{}
-impl SlintDataSrc for NullData {
-    fn get_kv(&self, _cf_name: &str, _query_values: bool) -> VecModel<ModelRc<StandardListViewItem>> {
-        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
-        row_data
-    }
-
-    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
-        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-        cf_data
-    }
-}
 
 enum Formatting {
     None(usize),
@@ -248,65 +230,6 @@ impl RdbData {
     }
 }
 
-impl SlintDataSrc for RdbData {
-    fn get_kv(&self, cf_name: &str, query_values: bool) -> VecModel<slint::ModelRc<StandardListViewItem>> {
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Column family {} query time: {:?}", cf_name, duration);
-        }
-
-        let db = &self.db;
-
-        let cf_handle = db.cf_handle(cf_name).unwrap();
-
-        println!("{:?}", db.get_column_family_metadata_cf(cf_handle).name);
-
-        let mut opts = rocksdb::ReadOptions::default();
-        opts.set_async_io(true);
-        opts.set_pin_data(true);
-        opts.fill_cache(false);
-        opts.set_allow_unprepared_value(true);
-        let mut it = db.raw_iterator_cf_opt(cf_handle, opts);
-        it.seek_to_first();
-
-        let row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
-        while it.valid() {
-            let t = Instant::now();
-            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
-            let items = Rc::new(VecModel::default());
-            items.push(key.into());
-
-            // TODO possibly different loop variant to not check each iteration, although branch predictor should handle it
-            if query_values {
-                it.prepare_value();
-                let val = it.value().unwrap();
-                let val_str = format_val(&val, Formatting::None(64)).unwrap();
-                items.push(val_str.as_str().into());
-            } else {
-                items.push("".into());
-            }
-
-            row_data.push(items.into());
-
-            println!("Query time {:?}. Key: {}", t.elapsed(), key);
-            it.next();
-        }
-
-        row_data
-    }
-
-    fn get_cfs(&self) -> VecModel<StandardListViewItem> {
-        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-
-        for cf in &self.cf_names {
-            cf_data.push(cf.as_str().into());
-        }
-
-        cf_data
-    }
-}
-
 macro_rules! toggle_progress_bar {
     ($ui_handle:expr, $op_name:expr, $is_indeterminate:ident, $show:ident) => {{
         let ui_handle = $ui_handle.clone();
@@ -346,8 +269,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let werker = Arc::new(worker::WorkerThread::new());
     let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
 
-    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
-    ui.global::<ListViewAdapter>().set_list_items(Rc::new(NullData{}.get_cfs()).into());
+    ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+    ui.global::<ListViewAdapter>().set_list_items(Rc::new(VecModel::default()).into());
 
     let ui_handle = ui.as_weak();
     let rdb_data_src_handle = rdb_data_src.clone();
@@ -511,7 +434,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         cf_data.push(cf.as_str().into());
                     }
 
-                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(NullData{}.get_kv("", false)).into());
+                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
                     handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
                     handle.set_status_msg(format!("Db open time: {:?}", duration).into());
                     handle.set_loaded_db_path(path_clone.into());
