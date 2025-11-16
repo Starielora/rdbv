@@ -160,7 +160,6 @@ impl RdbData {
         }
         let v = v.unwrap();
         format_val(&v, formatting)
-        // Ok(String::from_utf8_lossy(&v).to_string())
     }
 
     pub fn get_raw_val(&self, cf_name: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -230,6 +229,7 @@ impl RdbData {
     }
 }
 
+// TODO customize further, check upgrade_in_event_loop result
 macro_rules! toggle_progress_bar {
     ($ui_handle:expr, $op_name:expr, $is_indeterminate:ident, $show:ident) => {{
         let ui_handle = $ui_handle.clone();
@@ -244,12 +244,6 @@ macro_rules! toggle_progress_bar {
     }};
 }
 
-macro_rules! show_progress_bar {
-    ($ui_handle:expr, $op_name:expr) => {
-        toggle_progress_bar!($ui_handle, $op_name, false, true)
-    };
-}
-
 macro_rules! show_indeterminate_progress_bar {
     ($ui_handle:expr, $op_name:expr) => {
         toggle_progress_bar!($ui_handle, $op_name, true, true)
@@ -262,258 +256,314 @@ macro_rules! hide_progress_bar {
     };
 }
 
+fn db_value_preview_handler(ui: &AppWindow, rdb: &RdbData,cf: &str, key: &str, formatting: Formatting, full_view: bool) {
+    debug_assert!(!cf.is_empty());
+    debug_assert!(!key.is_empty());
+
+    let start = Instant::now();
+
+    if full_view {
+        ui.set_db_full_value_preview("".into());
+    }
+    else {
+        ui.set_db_value_preview("".into());
+    }
+
+    match rdb.get_val(cf, key, formatting) {
+        Ok(val) => {
+            if full_view {
+                ui.set_db_full_value_preview(val.into());
+            } else {
+                ui.set_db_value_preview(val.into());
+            }
+            ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
+        }
+        Err(e) => ui.set_status_msg(e.to_string().into()),
+    }
+}
+
+fn open_db(path: String, ui_handle: &slint::Weak<AppWindow>, rdb_handle: &Arc<Mutex<Option<RdbData>>>, worker: &WorkerThread) {
+    println!("{:?}", path.as_str());
+
+    let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+    let progress_bar_title = format!("Opening {:?}", path);
+    tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle, progress_bar_title)));
+
+    let ui_clone = ui_handle.clone();
+    let rdb_data_src_handle = rdb_handle.clone();
+    tasks.push(Box::new(
+        move |_cancel| {
+            let db = &mut *rdb_data_src_handle.lock().unwrap();
+            let start = Instant::now();
+            let db_open_result = RdbData::new(path.to_string());
+
+            // TODO pass this error msg to UI
+            if db_open_result.is_err() {
+                println!("{}", db_open_result.err().unwrap().into_string());
+                return;
+            }
+
+            let new_data_src = db_open_result.unwrap();
+            let duration = start.elapsed();
+            *db = Some(new_data_src);
+
+            let src = db.as_ref().unwrap();
+            let cf_names = src.cf_names.clone();
+            let path_clone = path.clone();
+            let _ = ui_clone.upgrade_in_event_loop(move |handle|{
+
+                let cf_data: VecModel<StandardListViewItem> = VecModel::default();
+                for cf in cf_names.iter() {
+                    cf_data.push(cf.as_str().into());
+                }
+
+                handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+                handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
+                handle.set_status_msg(format!("Db open time: {:?}", duration).into());
+                handle.set_loaded_db_path(path_clone.into());
+            });
+        }
+    ));
+
+    tasks.push(Box::new(hide_progress_bar!(ui_handle)));
+
+    worker.push_tasks(tasks);
+}
+
+fn get_formatting(ui_formatting: &str, chars_num: usize) -> Formatting {
+    match ui_formatting {
+        "None" => Formatting::None(chars_num),
+        "json" => Formatting::Json(),
+        "hex" => Formatting::Hex(chars_num),
+        _ => todo!("Unknown formatting value from UI."),
+    }
+}
+
+fn print_stderr(err: slint::EventLoopError) {
+    eprintln!("{:?}", err);
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
 
     let ui = AppWindow::new()?;
 
-    let werker = Arc::new(worker::WorkerThread::new());
-    let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
+    let notice_text = include_bytes!("../NOTICE");
+    ui.set_notice_text(std::str::from_utf8(notice_text).unwrap().into());
+    ui.set_window_name(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).into());
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
     ui.global::<ListViewAdapter>().set_list_items(Rc::new(VecModel::default()).into());
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.on_change_db_value_preview(move |cf, key, ui_formatting| {
-        if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
-            return;
-        }
+    let worker = Arc::new(worker::WorkerThread::new());
+    let rdb_data_src: Arc<Mutex<Option<RdbData>>> = Arc::new(Mutex::new(None));
 
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
-        ui.set_db_value_preview("".into());
-        // TODO fucking string contract
-        let formatting = match ui_formatting.as_str() {
-            "None" => Formatting::None(2048),
-            "json" => Formatting::Json(),
-            "hex" => Formatting::Hex(2048),
-            _ => Formatting::None(2048)
-        };
-        match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
-            Ok(val) => {
-                ui.set_db_value_preview(val.into());
-                ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
-            }
-            Err(e) => ui.set_status_msg(e.to_string().into()),
+    ui.global::<DbLoader>().on_load_db({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+        move |path| {
+            open_db(path.to_string(), &ui_handle, &rdb_handle, &worker);
         }
     });
 
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    let werker_clone = werker.clone();
-    ui.on_change_column_family(move |new_cf, query_values|{
-        if new_cf.is_empty() {
-            return;
+    ui.global::<DbLoader>().on_browse_for_db({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+
+        move ||{
+            let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
+
+            if let Some(path) = folder {
+                let path = path.into_os_string().into_string().expect("Got invalid UTF-8 string from folder picker.");
+                open_db(path, &ui_handle, &rdb_handle, &worker);
+            }
         }
+    });
 
-        werker_clone.cancel_currently_scheduled_work();
+    ui.on_change_db_value_preview({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
 
-        let rdb_data_src_handle = rdb_data_src_handle.clone();
-        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+        move |cf, key, ui_formatting| {
 
-        let progress_bar_title = format!("Loading column family {}", new_cf.as_str());
-        tasks.push(Box::new(show_progress_bar!(ui_handle, progress_bar_title)));
+            if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
+                return;
+            }
 
-        let ui_handle_clone = ui_handle.clone();
-        tasks.push(
-            Box::new(
-            move |cancel| {
-                let ui2 = ui_handle_clone.clone();
-                let progress_report = Box::new(move |progress: f32| {
-                    let _ = ui2.upgrade_in_event_loop(move |handle|{
-                        handle.set_work_progress(progress);
-                    }).unwrap();
-                });
+            let ui = ui_handle.unwrap();
+            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-                let progress_bar_title = format!("Loading keys of {}", new_cf.as_str());
-                let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
-                    ui.set_progress_is_indeterminate(false);
-                    ui.set_work_in_progress_name(progress_bar_title.into());
-                    ui.set_work_in_progress(true);
-                }).unwrap();
+            let formatting = get_formatting(ui_formatting.as_str(), 2048);
 
-                let start = Instant::now();
-                let keys = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_keys(new_cf.as_str(), progress_report, cancel);
-                let duration = start.elapsed();
+            db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
+        }
+    });
 
-                let mut row_data: Vec<(String, String)> = Vec::new();
+    // TODO shares most code with preview
+    ui.on_change_db_value_full_view({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
 
-                for k in keys.iter() {
-                    row_data.push((k.to_string(), "".to_string()));
-                }
+        move |cf, key, ui_formatting|{
 
-                let new_cf_clone = new_cf.clone();
-                let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
-                    let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+            if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
+                return;
+            }
 
-                    for (k, v) in row_data.iter() {
-                        let items = Rc::new(VecModel::default());
-                        items.push(k.as_str().into());
-                        items.push(v.as_str().into());
-                        ui_row_data.push(items.into());
+            let ui = ui_handle.unwrap();
+            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+
+            let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
+
+            db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, true);
+        }
+    });
+
+    ui.on_change_column_family({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+        move |cf, query_values|{
+            if cf.is_empty() {
+                return;
+            }
+
+            worker.cancel_currently_scheduled_work();
+
+            let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+
+            tasks.push(
+                Box::new({
+                let ui_handle = ui_handle.clone();
+                let rdb_handle = rdb_handle.clone();
+                move |cancel| {
+
+                    let progress_bar_title = format!("Loading keys of {}", cf.as_str());
+                    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                        ui.set_progress_is_indeterminate(false);
+                        ui.set_work_in_progress_name(progress_bar_title.into());
+                        ui.set_work_in_progress(true);
+                    }).map_err(print_stderr);
+
+                    let progress_report = Box::new({
+                        let ui = ui_handle.clone();
+                        move |progress: f32| {
+                            let _ = ui.upgrade_in_event_loop(move |handle|{
+                                handle.set_work_progress(progress);
+                            }).map_err(print_stderr);
+                        }
+                    });
+
+                    let start = Instant::now();
+                    let keys = {
+                        let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                        let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                        rdb.get_keys(cf.as_str(), progress_report, cancel)
+                    };
+                    let duration = start.elapsed();
+
+                    // TODO could preallocate this vec when getting keys instead of copying
+                    // For now perf is sufficient
+                    let mut row_data: Vec<(String, String)> = Vec::new();
+                    for k in keys.iter() {
+                        row_data.push((k.to_string(), "".to_string()));
                     }
 
-                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
-                    handle.set_status_msg(format!("{} CF keys query time: {:?}", new_cf_clone, duration).into());
-                }).unwrap();
+                    let _ = ui_handle.upgrade_in_event_loop({
+                        let cf = cf.clone();
+                        move |handle|{
+                            let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
-                if query_values {
+                            // VecModel is not Send and cannot be prepared on second thread.
+                            for (k, v) in row_data.iter() {
+                                let items = Rc::new(VecModel::default());
+                                items.push(k.as_str().into());
+                                items.push(v.as_str().into());
+                                ui_row_data.push(items.into());
+                            }
 
-                    let ui_handle_clone = ui_handle_clone.clone();
-                    let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
-                        handle.set_work_progress(0.0);
-                    }).unwrap();
+                            handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
+                            handle.set_status_msg(format!("{} CF keys query time: {:?}", cf, duration).into());
+                        }
+                    }).map_err(print_stderr);
 
-                    let new_cf_clone = new_cf.clone();
-                    let mut total_values_query_time = Duration::new(0, 0);
-                    for (i, key) in keys.iter().enumerate() {
-                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
+                    if query_values {
+
+                        let ui = ui_handle.clone();
+                        let _ = ui.upgrade_in_event_loop(move |handle|{
+                            handle.set_work_progress(0.0);
+                        }).map_err(print_stderr);
+
+                        let cf = cf.clone();
+                        let mut total_values_query_time = Duration::new(0, 0);
+                        for (i, key) in keys.iter().enumerate() {
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let progress_bar_title = format!("Loading {}", key);
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_work_in_progress_name(progress_bar_title.into());
+                            }).map_err(print_stderr);
+
+                            let start = Instant::now();
+                            let value = {
+                                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                                rdb.get_value(cf.as_ref(), key)
+                            };
+
+                            let value = format_val(&value, Formatting::None(2048)).unwrap().lines().nth(0).unwrap().to_string();
+                            total_values_query_time = total_values_query_time.add(start.elapsed());
+
+                            let _ = ui.upgrade_in_event_loop({
+                                let progress = i as f32 / keys.len() as f32;
+                                move |handle|{
+                                    // if the expect fails it means something must've changed the TableView inbetween
+                                    // in current design, this operation is not holding table view exclusively, which leaves it open for such bug
+                                    // TODO in such ocurrence display an explicit dialog, instead of panicking the app?
+                                    handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).expect(format!("Failed to get {} row of KV Table", i)).set_row_data(1, value.as_str().into());
+                                    handle.set_work_progress(progress);
+                                }
+                            }).map_err(print_stderr);
                         }
 
-                        let progress_bar_title = format!("Loading {}", key);
-                        let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
-                            ui.set_work_in_progress_name(progress_bar_title.into());
-                        }).unwrap();
-
-                        let start = Instant::now();
-                        let value = rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_value(&new_cf_clone.as_ref(), key);
-                        let value = format_val(&value, Formatting::None(2048)).unwrap().lines().nth(0).unwrap().to_string();
-                        total_values_query_time = total_values_query_time.add(start.elapsed());
-                        let progress = i as f32 / keys.len() as f32;
-                        let _ = ui_handle_clone.upgrade_in_event_loop(move |handle|{
-                            handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).unwrap().set_row_data(1, value.as_str().into());
-                            handle.set_work_progress(progress);
-                        }).unwrap();
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
+                            ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
+                            ui.set_work_in_progress(false);
+                        }).map_err(print_stderr);
                     }
+            }}));
 
-                    let _ = ui_handle_clone.upgrade_in_event_loop(move |ui| {
-                        ui.set_status_msg(format!("{} values query time: {:?}", new_cf_clone, total_values_query_time).into());
-                    }).unwrap();
-                }
-
-        }));
-
-        tasks.push(Box::new(hide_progress_bar!(ui_handle)));
-
-        werker_clone.push_tasks(tasks);
+            worker.push_tasks(tasks);
+        }
     });
 
-    let open_db = |path: String, ui_handle: &slint::Weak<AppWindow>, rdb_data_src_handle: &Arc<Mutex<Option<RdbData>>>, werker: &WorkerThread| {
+    ui.global::<DbLoader>().on_export_value_to_file({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
 
-        println!("{:?}", path.as_str());
+        move |cf, key|{
+            let file = rfd::FileDialog::new().set_directory("./").save_file();
 
-        let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
-        let progress_bar_title = format!("Opening {:?}", path);
-        tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle, progress_bar_title)));
-
-        let ui_clone = ui_handle.clone();
-        let rdb_data_src_handle = rdb_data_src_handle.clone();
-        tasks.push(Box::new(
-            move |_cancel| {
-                let db = &mut *rdb_data_src_handle.lock().unwrap();
-                let start = Instant::now();
-                let db_open_result = RdbData::new(path.to_string());
-
-                if db_open_result.is_err() {
-                    println!("{}", db_open_result.err().unwrap().into_string());
-                    return;
-                }
-
-                let new_data_src = db_open_result.unwrap();
+            let start = Instant::now();
+            defer!{
                 let duration = start.elapsed();
-                *db = Some(new_data_src);
-
-                let src = db.as_ref().unwrap();
-                let cf_names = src.cf_names.clone();
-                let path_clone = path.clone();
-                let _ = ui_clone.upgrade_in_event_loop(move |handle|{
-
-                    let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-                    for cf in cf_names.iter() {
-                        cf_data.push(cf.as_str().into());
-                    }
-
-                    handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
-                    handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
-                    handle.set_status_msg(format!("Db open time: {:?}", duration).into());
-                    handle.set_loaded_db_path(path_clone.into());
-                });
+                println!("Duration: {:?}", duration);
             }
-        ));
 
-        tasks.push(Box::new(hide_progress_bar!(ui_handle)));
+            let ui = ui_handle.unwrap();
+            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-        werker.push_tasks(tasks);
-    };
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    let werker_clone = werker.clone();
-    ui.global::<DbLoader>().on_load_db(move |path| {
-        open_db(path.to_string(), &ui_handle, &rdb_data_src_handle, &werker_clone);
-    });
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    let werker_clone = werker.clone();
-    ui.global::<DbLoader>().on_browse_for_db(move ||{
-        let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
-
-        match folder {
-            Some(path) => {
-                let path = path.into_os_string().into_string().unwrap();
-                open_db(path, &ui_handle, &rdb_data_src_handle, &werker_clone);
-            },
-            None => {},
-        }
-    });
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    // TODO shares most code with preview
-    ui.on_change_db_value_full_view(move |cf, key, ui_formatting|{
-        if cf.is_empty() || key.is_empty() || ui_formatting.is_empty() {
-            return;
-        }
-
-        let ui = ui_handle.unwrap();
-        let start = Instant::now();
-        ui.set_db_full_value_preview("".into());
-        // TODO fucking string contract
-        let formatting = match ui_formatting.as_str() {
-            "None" => Formatting::None(usize::MAX),
-            "json" => Formatting::Json(),
-            "hex" => Formatting::Hex(usize::MAX),
-            _ => Formatting::None(usize::MAX)
-        };
-        match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_val(cf.as_str(), key.as_str(), formatting) {
-            Ok(val) => {
-                ui.set_db_full_value_preview(val.into());
-                ui.set_status_msg(format!("Query time (with formatting): {:?}", start.elapsed()).into());
-            }
-            Err(e) => ui.set_status_msg(e.to_string().into()),
-        }
-    });
-
-    let ui_handle = ui.as_weak();
-    let rdb_data_src_handle = rdb_data_src.clone();
-    ui.global::<DbLoader>().on_export_value_to_file(move |cf, key|{
-        let file = rfd::FileDialog::new().set_directory("./").save_file();
-
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Duration: {:?}", duration);
-        }
-
-        let ui = ui_handle.unwrap();
-        // TODO wtf is this match shit, fix
-        match file {
-            Some(path) => {
-                match rdb_data_src_handle.lock().unwrap().as_ref().as_ref().unwrap().get_raw_val(cf.as_str(), key.as_str()) {
+            // Couldn't decide whether this match ladder is worse than and_then + map_err chain
+            if let Some(file) = file {
+                match rdb.get_raw_val(cf.as_str(), key.as_str()) {
                     Ok(buffer) => {
-                        match std::fs::File::create_new(path) {
+                        match std::fs::File::create_new(file) {
                             Ok(mut file) => {
                                 match file.write(&buffer.as_slice()) {
                                     Ok(_) => {
@@ -527,14 +577,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     },
                     Err(e) => ui.set_status_msg(e.to_string().into()),
                 }
-            },
-            None => {},
+            }
         }
     });
-
-    let notice_text = include_bytes!("../NOTICE");
-    ui.set_notice_text(std::str::from_utf8(notice_text).unwrap().into());
-    ui.set_window_name(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).into());
 
     ui.run()?;
 
