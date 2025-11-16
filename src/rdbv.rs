@@ -150,19 +150,7 @@ impl RdbData {
     }
 
     pub fn get_val(&self, cf_name: &str, key: &str, formatting: Formatting) -> Result<String, Box<dyn Error>> {
-        let start = Instant::now();
-        defer!{
-            let duration = start.elapsed();
-            println!("Value query time: {:?}", duration);
-        }
-
-        println!("Query: {:?}", key);
-        let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_pinned_cf(cf_handle, key)?;
-        if v.is_none() {
-            Err(format!("Failed to get pinned value for key {:?}", key))?
-        }
-        let v = v.unwrap();
+        let v = self.get_raw_val(cf_name, key)?;
         format_val(&v, formatting)
     }
 
@@ -170,18 +158,14 @@ impl RdbData {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
-            println!("Value query time: {:?}", duration);
+            println!("Value query time for {}: {:?}", key, duration);
         }
 
-        let cf_handle = self.db.cf_handle(cf_name).unwrap();
-        let v = self.db.get_pinned_cf(cf_handle, key)?;
-        if v.is_none() {
-            Err(format!("Failed to get pinned value for key {:?}", key))?
-        }
-        Ok(v.unwrap().to_vec())
+        let cf_handle = self.db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?;
+        Ok(self.db.get_pinned_cf(cf_handle, key)?.ok_or(format!("Failed to get pinned value for key {:?}", key))?.to_vec())
     }
 
-    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Vec<String> {
+    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Result<Vec<String>, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -190,7 +174,8 @@ impl RdbData {
 
         let db = &self.db;
 
-        let cf_handle = db.cf_handle(cf_name).unwrap();
+        let cf_handle = db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?;
+        let est_keys_num = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys")?.ok_or("Failed to get estimated number of keys")?; // TODO it's not essential for this function to work
 
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_async_io(true);
@@ -202,14 +187,13 @@ impl RdbData {
 
         let mut keys = Vec::new();
 
-        let est_keys_num = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys").unwrap().unwrap();
         let mut actual_keys_num = 0;
         while it.valid() {
             if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
             let t = Instant::now();
-            let key = std::str::from_utf8(it.key().unwrap()).unwrap();
+            let key = std::str::from_utf8(it.key().expect("Iterator accessed without checking for validity"))?;
 
             keys.push(key.to_string());
 
@@ -219,17 +203,7 @@ impl RdbData {
             progress_report(actual_keys_num as f32 / est_keys_num as f32);
         }
 
-        println!("keys: {}; actual: {}", est_keys_num, actual_keys_num);
-
-        keys
-    }
-
-    pub fn get_value(&self, cf_name: &str, key: &str) -> Vec<u8> {
-        // TODO unwrap
-        let cf_handle = &self.db.cf_handle(cf_name).unwrap();
-        let val = &self.db.get_cf(cf_handle, key).unwrap().unwrap();
-        // TODO legit clone?
-        val.clone()
+        Ok(keys)
     }
 }
 
@@ -471,7 +445,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let keys = {
                             let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
                             let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-                            rdb.get_keys(cf.as_str(), progress_report, cancel)
+                            rdb.get_keys(cf.as_str(), progress_report, cancel)?
                         };
                         let duration = start.elapsed();
 
@@ -523,10 +497,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let value = {
                                     let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
                                     let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-                                    rdb.get_value(cf.as_ref(), key)
+                                    rdb.get_val(cf.as_ref(), key, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string()
                                 };
 
-                                let value = format_val(&value, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string();
                                 total_values_query_time = total_values_query_time.add(start.elapsed());
 
                                 let _ = ui.upgrade_in_event_loop({
