@@ -31,7 +31,7 @@ struct RdbData{
 
 fn format_ascii_u8(v: u8) -> char
 {
-    if !v.is_ascii_graphic() { '.' } else { char::from_u32((v).into()).unwrap() }
+    if !v.is_ascii_graphic() { '.' } else { v as char }
 }
 
 // TODO This must be slow af, pls fix
@@ -294,38 +294,40 @@ fn open_db(path: String, ui_handle: &slint::Weak<AppWindow>, rdb_handle: &Arc<Mu
     tasks.push(Box::new(show_indeterminate_progress_bar!(ui_handle, progress_bar_title)));
 
     let ui_clone = ui_handle.clone();
-    let rdb_data_src_handle = rdb_handle.clone();
+    let rdb_handle = rdb_handle.clone();
     tasks.push(Box::new(
         move |_cancel| {
-            let db = &mut *rdb_data_src_handle.lock().unwrap();
             let start = Instant::now();
-            let db_open_result = RdbData::new(path.to_string());
+            match RdbData::new(path.to_string()) {
+                Ok(rdb) => {
+                    let duration = start.elapsed();
+                    let cf_names = rdb.cf_names.clone();
 
-            // TODO pass this error msg to UI
-            if db_open_result.is_err() {
-                println!("{}", db_open_result.err().unwrap().into_string());
-                return;
+                    {
+                        let mut rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                        *rdb_guard = Some(rdb);
+                    }
+
+                    let path_clone = path.clone();
+                    let _ = ui_clone.upgrade_in_event_loop(move |handle|{
+
+                        let cf_data: VecModel<StandardListViewItem> = VecModel::default();
+                        for cf in cf_names.iter() {
+                            cf_data.push(cf.as_str().into());
+                        }
+
+                        handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+                        handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
+                        handle.set_status_msg(format!("Db open time: {:?}", duration).into());
+                        handle.set_loaded_db_path(path_clone.into());
+                    }).map_err(print_stderr);
+                },
+                Err(err) => {
+                    // TODO pass this error msg to UI
+                    println!("{}", err.into_string());
+                },
             }
 
-            let new_data_src = db_open_result.unwrap();
-            let duration = start.elapsed();
-            *db = Some(new_data_src);
-
-            let src = db.as_ref().unwrap();
-            let cf_names = src.cf_names.clone();
-            let path_clone = path.clone();
-            let _ = ui_clone.upgrade_in_event_loop(move |handle|{
-
-                let cf_data: VecModel<StandardListViewItem> = VecModel::default();
-                for cf in cf_names.iter() {
-                    cf_data.push(cf.as_str().into());
-                }
-
-                handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
-                handle.global::<ListViewAdapter>().set_list_items(Rc::new(cf_data).into());
-                handle.set_status_msg(format!("Db open time: {:?}", duration).into());
-                handle.set_loaded_db_path(path_clone.into());
-            });
         }
     ));
 
@@ -352,7 +354,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
 
     let notice_text = include_bytes!("../NOTICE");
-    ui.set_notice_text(std::str::from_utf8(notice_text).unwrap().into());
+    ui.set_notice_text(std::str::from_utf8(notice_text)?.into());
     ui.set_window_name(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).into());
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
@@ -580,24 +582,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
             let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-            // Couldn't decide whether this match ladder is worse than and_then + map_err chain
             if let Some(file) = file {
-                match rdb.get_raw_val(cf.as_str(), key.as_str()) {
-                    Ok(buffer) => {
-                        match std::fs::File::create_new(file) {
-                            Ok(mut file) => {
-                                match file.write(&buffer.as_slice()) {
-                                    Ok(_) => {
-                                        ui.set_status_msg(format!("Write time {:?}", start.elapsed()).into());
-                                    }
-                                    Err(e) => ui.set_status_msg(e.to_string().into()),
-                                }
-                            },
-                            Err(e) => ui.set_status_msg(e.to_string().into()),
-                        }
-                    },
-                    Err(e) => ui.set_status_msg(e.to_string().into()),
-                }
+                let _ = || -> Result<(), Box<dyn Error>> {
+                    let buffer = rdb.get_raw_val(cf.as_str(), key.as_str())?;
+                    std::fs::File::create_new(file)?.write(&buffer.as_slice())?;
+                    Ok(())
+                }().map_err(|e| {
+                    ui.set_status_msg(e.to_string().into());
+                });
             }
         }
     });
