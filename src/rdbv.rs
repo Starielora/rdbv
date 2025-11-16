@@ -83,9 +83,13 @@ fn format_hex_ascii(val: &[u8]) -> String {
 fn format_val(val: &[u8], formatting: Formatting) -> Result<String, Box<dyn Error>>
 {
     let (val, was_cut) = match formatting {
-        Formatting::None(max_chars) => (val.get(..usize::min(max_chars, val.len())).unwrap(), val.len() > max_chars),
+        Formatting::None(max_chars) | Formatting::Hex(max_chars) => {
+            let range = usize::min(max_chars, val.len());
+            let val = val.get(..range).ok_or(format!("Invalid subslice range. Tried to get [0..{}], but slice has len {}", range, val.len()).to_string())?;
+            let was_cut = val.len() > max_chars;
+            (val, was_cut)
+        },
         Formatting::Json() => (val, false), // assume json formatting always parses full json
-        Formatting::Hex(max_chars) => (val.get(..usize::min(max_chars, val.len())).unwrap(), val.len() > max_chars),
     };
 
     match std::str::from_utf8(val) {
@@ -437,105 +441,122 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             tasks.push(
                 Box::new({
-                let ui_handle = ui_handle.clone();
+                let ui = ui_handle.clone();
                 let rdb_handle = rdb_handle.clone();
                 move |cancel| {
 
-                    let progress_bar_title = format!("Loading keys of {}", cf.as_str());
-                    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
-                        ui.set_progress_is_indeterminate(false);
-                        ui.set_work_in_progress_name(progress_bar_title.into());
-                        ui.set_work_in_progress(true);
-                    }).map_err(print_stderr);
-
-                    let progress_report = Box::new({
-                        let ui = ui_handle.clone();
-                        move |progress: f32| {
-                            let _ = ui.upgrade_in_event_loop(move |handle|{
-                                handle.set_work_progress(progress);
-                            }).map_err(print_stderr);
-                        }
-                    });
-
-                    let start = Instant::now();
-                    let keys = {
-                        let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                        let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-                        rdb.get_keys(cf.as_str(), progress_report, cancel)
-                    };
-                    let duration = start.elapsed();
-
-                    // TODO could preallocate this vec when getting keys instead of copying
-                    // For now perf is sufficient
-                    let mut row_data: Vec<(String, String)> = Vec::new();
-                    for k in keys.iter() {
-                        row_data.push((k.to_string(), "".to_string()));
-                    }
-
-                    let _ = ui_handle.upgrade_in_event_loop({
-                        let cf = cf.clone();
-                        move |handle|{
-                            let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
-
-                            // VecModel is not Send and cannot be prepared on second thread.
-                            for (k, v) in row_data.iter() {
-                                let items = Rc::new(VecModel::default());
-                                items.push(k.as_str().into());
-                                items.push(v.as_str().into());
-                                ui_row_data.push(items.into());
-                            }
-
-                            handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
-                            handle.set_status_msg(format!("{} CF keys query time: {:?}", cf, duration).into());
-                        }
-                    }).map_err(print_stderr);
-
-                    if query_values {
-
-                        let ui = ui_handle.clone();
-                        let _ = ui.upgrade_in_event_loop(move |handle|{
-                            handle.set_work_progress(0.0);
+                    let ui_handle = ui.clone();
+                    let rdb_handle = rdb_handle.clone();
+                    let cf = cf.clone();
+                    let result = move || -> Result<(), Box<dyn Error>> {
+                        let progress_bar_title = format!("Loading keys of {}", cf.as_str());
+                        let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                            ui.set_progress_is_indeterminate(false);
+                            ui.set_work_in_progress_name(progress_bar_title.into());
+                            ui.set_work_in_progress(true);
                         }).map_err(print_stderr);
 
-                        let cf = cf.clone();
-                        let mut total_values_query_time = Duration::new(0, 0);
-                        for (i, key) in keys.iter().enumerate() {
-                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-
-                            let progress_bar_title = format!("Loading {}", key);
-                            let _ = ui.upgrade_in_event_loop(move |ui| {
-                                ui.set_work_in_progress_name(progress_bar_title.into());
-                            }).map_err(print_stderr);
-
-                            let start = Instant::now();
-                            let value = {
-                                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-                                rdb.get_value(cf.as_ref(), key)
-                            };
-
-                            let value = format_val(&value, Formatting::None(2048)).unwrap().lines().nth(0).unwrap().to_string();
-                            total_values_query_time = total_values_query_time.add(start.elapsed());
-
-                            let _ = ui.upgrade_in_event_loop({
-                                let progress = i as f32 / keys.len() as f32;
-                                move |handle|{
-                                    // if the expect fails it means something must've changed the TableView inbetween
-                                    // in current design, this operation is not holding table view exclusively, which leaves it open for such bug
-                                    // TODO in such ocurrence display an explicit dialog, instead of panicking the app?
-                                    handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).expect(format!("Failed to get {} row of KV Table", i)).set_row_data(1, value.as_str().into());
+                        let progress_report = Box::new({
+                            let ui = ui_handle.clone();
+                            move |progress: f32| {
+                                let _ = ui.upgrade_in_event_loop(move |handle|{
                                     handle.set_work_progress(progress);
-                                }
-                            }).map_err(print_stderr);
+                                }).map_err(print_stderr);
+                            }
+                        });
+
+                        let start = Instant::now();
+                        let keys = {
+                            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                            rdb.get_keys(cf.as_str(), progress_report, cancel)
+                        };
+                        let duration = start.elapsed();
+
+                        // TODO could preallocate this vec when getting keys instead of copying
+                        // For now perf is sufficient
+                        let mut row_data: Vec<(String, String)> = Vec::new();
+                        for k in keys.iter() {
+                            row_data.push((k.to_string(), "".to_string()));
                         }
 
-                        let _ = ui.upgrade_in_event_loop(move |ui| {
-                            ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
-                            ui.set_work_in_progress(false);
+                        let _ = ui_handle.upgrade_in_event_loop({
+                            let cf = cf.clone();
+                            move |handle|{
+                                let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
+
+                                // VecModel is not Send and cannot be prepared on second thread.
+                                for (k, v) in row_data.iter() {
+                                    let items = Rc::new(VecModel::default());
+                                    items.push(k.as_str().into());
+                                    items.push(v.as_str().into());
+                                    ui_row_data.push(items.into());
+                                }
+
+                                handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
+                                handle.set_status_msg(format!("{} CF keys query time: {:?}", cf, duration).into());
+                            }
                         }).map_err(print_stderr);
+
+                        if query_values {
+
+                            let ui = ui_handle.clone();
+                            let _ = ui.upgrade_in_event_loop(move |handle|{
+                                handle.set_work_progress(0.0);
+                            }).map_err(print_stderr);
+
+                            let cf = cf.clone();
+                            let mut total_values_query_time = Duration::new(0, 0);
+                            for (i, key) in keys.iter().enumerate() {
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                let progress_bar_title = format!("Loading {}", key);
+                                let _ = ui.upgrade_in_event_loop(move |ui| {
+                                    ui.set_work_in_progress_name(progress_bar_title.into());
+                                }).map_err(print_stderr);
+
+                                let start = Instant::now();
+                                let value = {
+                                    let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                                    let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                                    rdb.get_value(cf.as_ref(), key)
+                                };
+
+                                let value = format_val(&value, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string();
+                                total_values_query_time = total_values_query_time.add(start.elapsed());
+
+                                let _ = ui.upgrade_in_event_loop({
+                                    let progress = i as f32 / keys.len() as f32;
+                                    move |handle|{
+                                        // if the expect fails it means something must've changed the TableView inbetween
+                                        // in current design, this operation is not holding table view exclusively, which leaves it open for such bug
+                                        // TODO in such ocurrence display an explicit dialog, instead of panicking the app?
+                                        handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).expect(format!("Failed to get {} row of KV Table", i).as_str()).set_row_data(1, value.as_str().into());
+                                        handle.set_work_progress(progress);
+                                    }
+                                }).map_err(print_stderr);
+                            }
+
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
+                                ui.set_work_in_progress(false);
+                            }).map_err(print_stderr);
+                        }
+                        Ok(())
+                    };
+
+                    match result() {
+                        Ok(_) => {},
+                        Err(err) => {
+                            let msg = format!("{}", err.to_string());
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                ui.set_status_msg(msg.as_str().into());
+                            });
+                        },
                     }
+
             }}));
 
             worker.push_tasks(tasks);
