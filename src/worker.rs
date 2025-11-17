@@ -27,31 +27,51 @@ impl WorkerThread {
 
                 let (wakeup_mtx, cvar) = &*wakeup;
 
-                loop {
+                'work_loop: loop {
                     start_barrier.wait();
                     println!("Waiting for werk");
                     {
-                        let wakeup_guard = wakeup_mtx.lock().expect("Poisoned mutex. Nobody else should hold this mtx, so that's unexpected");
-                        let shutdown = cvar.wait_while(wakeup_guard, |shutdown| {
-                            !*shutdown && tasks.lock().unwrap().is_empty()
-                        }).unwrap();
+                        let wakeup_guard = match wakeup_mtx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break 'work_loop,
+                        };
+                        let shutdown = match cvar.wait_while(wakeup_guard, |shutdown| {
+                            !*shutdown && match tasks.lock() {
+                                Ok(tasks) => tasks.is_empty(),
+                                Err(_) => {
+                                    // this worker thread has poisoned a mutex, which means main thread panicked while inserting tasks.
+                                    // A very unlikely scenario, and it would also crash the whole app regardless, which is handled in panic handler.
+                                    *shutdown = true;
+                                    false
+                                },
+                            }
+                        })
+                        {
+                            Ok(guard) => guard,
+                            Err(_) => break 'work_loop
+                        };
 
                         if *shutdown {
                             println!("Shutdown requested. Bye");
-                            break;
+                            break 'work_loop;
                         }
                     }
+
                     println!("Doing werk");
 
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
-                    let mut tasks_guard = tasks.lock().expect("Poisoned mtx");
+                    let mut tasks_guard = match tasks.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => break 'work_loop,
+                    };
+
                     let tasks = &mut *tasks_guard;
 
                     for task in tasks.iter() {
                         let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
                         if cancelled {
-                            break;
+                            break 'work_loop;
                         }
                         else {
                             task(&*cancel);
@@ -74,7 +94,8 @@ impl WorkerThread {
     }
 
     pub fn push_tasks(&self, mut user_tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>>) {
-        let tasks = &mut *self.tasks.lock().unwrap();
+        let mut tasks_guard = self.tasks.lock().expect("Poisoned mtx");
+        let tasks = &mut *tasks_guard;
         tasks.append(&mut user_tasks);
 
         self.wakeup.1.notify_one();
@@ -93,14 +114,14 @@ impl std::ops::Drop for WorkerThread {
         let (shutdown_mtx, cvar) = &*self.wakeup;
 
         {
-            let mut shutdown = shutdown_mtx.lock().unwrap();
-            *shutdown = true;
+            let mut shutdown_guard = shutdown_mtx.lock().expect("Poisoned mtx");
+            *shutdown_guard = true;
         }
 
         cvar.notify_one();
 
         if let Some(thread) = self.thread_handle.take() {
-            thread.join().expect("Failed to join worker thread.");
+            let _ = thread.join();
         }
     }
 }

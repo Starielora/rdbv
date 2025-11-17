@@ -21,6 +21,7 @@ scopeguard = "1.2.0"
 slint = "1.13.1"
 formatjson = "0.3.1"
 rfd = "0.15.4"
+windows-sys = { version="0.61.2", features = [ "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell" ] }
 
 [build-dependencies]
 slint-build = "1.13.1"

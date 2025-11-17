@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slint::{Model, StandardListViewItem, VecModel};
+use slint::{ComponentHandle, Model, StandardListViewItem, VecModel};
 
 slint::include_modules!();
 
@@ -19,6 +19,7 @@ use crate::worker::WorkerThread;
 mod worker;
 
 use std::panic;
+use windows_sys::{core::*, Win32::UI::Shell::*, Win32::UI::WindowsAndMessaging::*};
 
 enum Formatting {
     None(usize),
@@ -327,11 +328,38 @@ fn print_stderr(err: slint::EventLoopError) {
 
 fn main() -> Result<(), Box<dyn Error>> {
 
-    panic::set_hook(Box::new(|panic_info| {
-        println!("panic occurred: {panic_info}");
-    }));
-
     let ui = AppWindow::new()?;
+    let critical_error_occurred: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Option::None));
+
+    panic::set_hook(Box::new({
+        let ui = ui.as_weak();
+        let critical_error_occured = critical_error_occurred.clone();
+        move |panic_info| {
+        let msg = format!("{panic_info}");
+        unsafe {
+
+            {
+                // if this lock fails then no msg will be printed and app exit code will be 0. 
+                // Should I fix this with an AtomicBool or sth, or is this failure impossible?
+                if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
+                    *critical_error_guard = Some(msg.clone());
+                }
+            }
+
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
+            });
+
+            ShellMessageBoxA(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                msg.as_ptr(),
+                s!("Critical error"),
+                MB_ICONERROR,
+            );
+        }
+    }}));
+
 
     let notice_text = include_bytes!("../NOTICE");
     ui.set_notice_text(std::str::from_utf8(notice_text)?.into());
@@ -377,13 +405,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             }
 
-            let ui = ui_handle.unwrap();
-            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+            if let Some(ui) = ui_handle.upgrade() {
+                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-            let formatting = get_formatting(ui_formatting.as_str(), 2048);
+                let formatting = get_formatting(ui_formatting.as_str(), 2048);
 
-            db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
+                db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
+            }
         }
     });
 
@@ -398,13 +427,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             }
 
-            let ui = ui_handle.unwrap();
-            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+            if let Some(ui) = ui_handle.upgrade() {
+                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-            let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
+                let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
 
-            db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, true);
+                db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, true);
+            }
         }
     });
 
@@ -557,23 +587,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("Duration: {:?}", duration);
             }
 
-            let ui = ui_handle.unwrap();
-            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+            if let Some(ui) = ui_handle.upgrade() {
+                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
 
-            if let Some(file) = file {
-                let _ = || -> Result<(), Box<dyn Error>> {
-                    let buffer = rdb.get_raw_val(cf.as_str(), key.as_str())?;
-                    std::fs::File::create_new(file)?.write(&buffer.as_slice())?;
-                    Ok(())
-                }().map_err(|e| {
-                    ui.set_status_msg(e.to_string().into());
-                });
+                if let Some(file) = file {
+                    let _ = || -> Result<(), Box<dyn Error>> {
+                        let buffer = rdb.get_raw_val(cf.as_str(), key.as_str())?;
+                        std::fs::File::create_new(file)?.write(&buffer.as_slice())?;
+                        Ok(())
+                    }().map_err(|e| {
+                        ui.set_status_msg(e.to_string().into());
+                    });
+                }
             }
         }
     });
 
     ui.run()?;
+
+    match critical_error_occurred.lock() {
+        Ok(mut msg_opt) => {
+            if let Some(msg) = (*msg_opt).take() {
+                Err(msg)?
+            }
+        },
+        Err(mut err) => {
+            // best effort at retrieving msg?
+            // does it even make sense? it would mean that panic handler panicked while holding this mtx
+            if let Some(msg) = (*err.get_mut()).take() {
+                Err(msg)?
+            }
+        },
+    };
 
     Ok(())
 }
