@@ -94,11 +94,13 @@ impl WorkerThread {
     }
 
     pub fn push_tasks(&self, mut user_tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>>) {
-        let mut tasks_guard = self.tasks.lock().expect("Poisoned mtx");
-        let tasks = &mut *tasks_guard;
-        tasks.append(&mut user_tasks);
+        if let Ok(mut tasks_guard) = self.tasks.lock() {
+            let tasks = &mut *tasks_guard;
+            tasks.append(&mut user_tasks);
 
-        self.wakeup.1.notify_one();
+            self.wakeup.1.notify_one();
+        }
+        // otherwise thread panicked, no reason to push tasks, the app should shutdown soon
     }
 
     pub fn cancel_currently_scheduled_work(&self) {
@@ -114,8 +116,16 @@ impl std::ops::Drop for WorkerThread {
         let (shutdown_mtx, cvar) = &*self.wakeup;
 
         {
-            let mut shutdown_guard = shutdown_mtx.lock().expect("Poisoned mtx");
-            *shutdown_guard = true;
+            match shutdown_mtx.lock() {
+                Ok(mut shutdown_guard) => {
+                    *shutdown_guard = true;
+                },
+                Err(_) => {
+                    // thread panicked, nothing more I can do.
+                    // join would return error, which is ignored anyways
+                    return;
+                },
+            };
         }
 
         cvar.notify_one();
@@ -132,7 +142,7 @@ mod test {
 
     #[test]
     fn start_stop_doesnt_hang() {
-        let werker = WorkerThread::new();
+        let _werker = WorkerThread::new();
     }
 
     #[test]
@@ -140,32 +150,34 @@ mod test {
         let werker = WorkerThread::new();
         let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
-        let mut w1 = Arc::new(Mutex::new(false));
-        let mut w1_cvar = Arc::new(Condvar::new());
+        let w1 = Arc::new((Mutex::new(false), Condvar::new()));
 
-        let w1_clone = w1.clone(); 
-        let w1_cvar_clone = w1_cvar.clone();
-        tasks.push(Box::new(move |_cancel| {
-            *w1_clone.lock().unwrap() = true;
-            w1_cvar_clone.notify_one();
-        }));
+        tasks.push(Box::new({
+            let w1 = w1.clone();
+            move |_cancel| {
+            let (mtx, cvar) = &*w1;
+            *mtx.lock().unwrap() = true;
+            cvar.notify_one();
+        }}));
 
-        let mut w2 = Arc::new(Mutex::new(false));
-        let mut w2_cvar = Arc::new(Condvar::new());
+        let w2 = Arc::new((Mutex::new(false), Condvar::new()));
 
-        let w2_clone = w2.clone(); 
-        let w2_cvar_clone = w2_cvar.clone();
-        tasks.push(Box::new(move |_cancel| {
-            *w2_clone.lock().unwrap() = true;
-            w2_cvar_clone.notify_one();
-        }));
+        tasks.push(Box::new({
+            let w2 = w2.clone();
+            move |_cancel| {
+            let (mtx, cvar) = &*w2;
+            *mtx.lock().unwrap() = true;
+            cvar.notify_one();
+        }}));
 
         werker.push_tasks(tasks);
 
-        let val = w1_cvar.wait_while(w1.lock().unwrap(), |isset| { !*isset }).unwrap();
+        let (w1_mtx, w1_cvar) = &*w1;
+        let val = w1_cvar.wait_while(w1_mtx.lock().unwrap(), |isset| { !*isset }).unwrap();
         assert_eq!(*val, true);
 
-        let val = w2_cvar.wait_while(w2.lock().unwrap(), |isset| { !*isset }).unwrap();
+        let (w2_mtx, w2_cvar) = &*w2;
+        let val = w2_cvar.wait_while(w2_mtx.lock().unwrap(), |isset| { !*isset }).unwrap();
         assert_eq!(*val, true);
     }
 
@@ -174,8 +186,8 @@ mod test {
         let werker = WorkerThread::new();
         let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
 
-        let mut w1_main_thread = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut w1_work_thread = Arc::new((Mutex::new(()), Condvar::new()));
+        let w1_main_thread = Arc::new((Mutex::new(false), Condvar::new()));
+        let w1_work_thread = Arc::new((Mutex::new(()), Condvar::new()));
 
         let w1_main_thread_clone = w1_main_thread.clone(); 
         let w1_work_thread_clone = w1_work_thread.clone();

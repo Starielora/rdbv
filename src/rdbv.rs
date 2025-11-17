@@ -507,6 +507,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                                 handle.global::<TableViewPageAdapter>().set_row_data(Rc::new(ui_row_data).into());
                                 handle.set_status_msg(format!("{} CF keys query time: {:?}", cf, duration).into());
+                                handle.set_work_in_progress(false);
                             }
                         }).map_err(print_stderr);
 
