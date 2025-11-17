@@ -18,6 +18,8 @@ use crate::worker::WorkerThread;
 
 mod worker;
 
+use std::panic;
+
 enum Formatting {
     None(usize),
     Json(),
@@ -324,6 +326,10 @@ fn print_stderr(err: slint::EventLoopError) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+
+    panic::set_hook(Box::new(|panic_info| {
+        println!("panic occurred: {panic_info}");
+    }));
 
     let ui = AppWindow::new()?;
 

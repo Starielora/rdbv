@@ -30,20 +30,23 @@ impl WorkerThread {
                 loop {
                     start_barrier.wait();
                     println!("Waiting for werk");
-                    let shutdown = cvar.wait_while(wakeup_mtx.lock().unwrap(), |shutdown| {
-                        !*shutdown && tasks.lock().unwrap().is_empty()
-                    }).unwrap();
+                    {
+                        let wakeup_guard = wakeup_mtx.lock().expect("Poisoned mutex. Nobody else should hold this mtx, so that's unexpected");
+                        let shutdown = cvar.wait_while(wakeup_guard, |shutdown| {
+                            !*shutdown && tasks.lock().unwrap().is_empty()
+                        }).unwrap();
 
-                    if *shutdown {
-                        println!("Shutdown requested. Bye");
-                        break;
+                        if *shutdown {
+                            println!("Shutdown requested. Bye");
+                            break;
+                        }
                     }
-
                     println!("Doing werk");
 
                     cancel.store(false, std::sync::atomic::Ordering::Relaxed);
 
-                    let tasks = &mut *tasks.lock().unwrap();
+                    let mut tasks_guard = tasks.lock().expect("Poisoned mtx");
+                    let tasks = &mut *tasks_guard;
 
                     for task in tasks.iter() {
                         let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
