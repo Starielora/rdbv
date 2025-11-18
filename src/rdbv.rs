@@ -157,6 +157,10 @@ impl RdbData {
         format_val(&v, formatting)
     }
 
+    fn get_cf_handle(&self, cf_name: &str) -> Result<&rocksdb::ColumnFamily, Box<dyn Error>> {
+        Ok(self.db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?) // Fails only if UI passess different string - should I expect validity and crash app otherwise?
+    }
+
     pub fn get_raw_val(&self, cf_name: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
@@ -164,11 +168,11 @@ impl RdbData {
             println!("Value query time for {}: {:?}", key, duration);
         }
 
-        let cf_handle = self.db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?;
-        Ok(self.db.get_pinned_cf(cf_handle, key)?.ok_or(format!("Failed to get pinned value for key {:?}", key))?.to_vec())
+        let cf_handle = self.get_cf_handle(cf_name)?;
+        Ok(self.db.get_pinned_cf(cf_handle, key)?.ok_or(format!("No value found for key {:?}", key))?.to_vec())
     }
 
-    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, cancel: &AtomicBool) -> Result<Vec<String>, Box<dyn Error>> {
+    pub fn get_keys(&self, cf_name: &str, progress_report: Box<dyn Fn(f32)>, set_progress_indeterminate: Box<dyn Fn()>, cancel: &AtomicBool) -> Result<Vec<String>, Box<dyn Error>> {
         let start = Instant::now();
         defer!{
             let duration = start.elapsed();
@@ -177,8 +181,14 @@ impl RdbData {
 
         let db = &self.db;
 
-        let cf_handle = db.cf_handle(cf_name).ok_or(format!("Failed to get handle for cf {}", cf_name))?;
-        let est_keys_num = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys")?.ok_or("Failed to get estimated number of keys")?; // TODO it's not essential for this function to work
+        let cf_handle = self.get_cf_handle(cf_name)?;
+
+        let est_keys_num = if let Ok(Some(est_keys_num)) = db.property_int_value_cf(cf_handle, "rocksdb.estimate-num-keys") {
+            est_keys_num
+        } else {
+            set_progress_indeterminate();
+            0
+        };
 
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_async_io(true);
@@ -196,7 +206,7 @@ impl RdbData {
                 break;
             }
             let t = Instant::now();
-            let key = std::str::from_utf8(it.key().expect("Iterator accessed without checking for validity"))?;
+            let key = std::str::from_utf8(it.key().expect("Database invalid iterator access."))?;
 
             keys.push(key.to_string());
 
@@ -326,6 +336,13 @@ fn print_stderr(err: slint::EventLoopError) {
     eprintln!("{:?}", err);
 }
 
+macro_rules! lock_db {
+    ($handle:ident, $guard:ident, $rdb:ident) => {
+        let $guard = $handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
+        let $rdb = $guard.as_ref().expect("Value preview handler called without database loaded");
+    };
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
 
     let ui = AppWindow::new()?;
@@ -389,7 +406,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
 
             if let Some(path) = folder {
-                let path = path.into_os_string().into_string().expect("Got invalid UTF-8 string from folder picker.");
+                let path = path.into_os_string().into_string().expect("Got string which is inconvertible to UTF-8 from folder picker.");
                 open_db(path, &ui_handle, &rdb_handle, &worker);
             }
         }
@@ -406,11 +423,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if let Some(ui) = ui_handle.upgrade() {
-                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-
                 let formatting = get_formatting(ui_formatting.as_str(), 2048);
 
+                lock_db!(rdb_handle, guard, rdb);
                 db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
             }
         }
@@ -428,8 +443,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if let Some(ui) = ui_handle.upgrade() {
-                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                lock_db!(rdb_handle, guard, rdb);
 
                 let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
 
@@ -477,11 +491,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                             }
                         });
 
+                        let set_progres_indeterminate = Box::new({
+                            let ui = ui_handle.clone();
+                            move || {
+                                let _ = ui.upgrade_in_event_loop(move |handle|{
+                                    handle.set_progress_is_indeterminate(true);
+                                }).map_err(print_stderr);
+                            }
+                        });
+
                         let start = Instant::now();
                         let keys = {
-                            let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                            let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
-                            rdb.get_keys(cf.as_str(), progress_report, cancel)?
+                            lock_db!(rdb_handle, guard, rdb);
+                            rdb.get_keys(cf.as_str(), progress_report, set_progres_indeterminate, cancel)?
                         };
                         let duration = start.elapsed();
 
@@ -516,6 +538,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let ui = ui_handle.clone();
                             let _ = ui.upgrade_in_event_loop(move |handle|{
                                 handle.set_work_progress(0.0);
+                                handle.set_work_in_progress(true);
                             }).map_err(print_stderr);
 
                             let cf = cf.clone();
@@ -532,8 +555,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                                 let start = Instant::now();
                                 let value = {
-                                    let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                                    let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                                    lock_db!(rdb_handle, guard, rdb);
                                     rdb.get_val(cf.as_ref(), key, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string()
                                 };
 
@@ -589,8 +611,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if let Some(ui) = ui_handle.upgrade() {
-                let rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                let rdb = rdb_guard.as_ref().expect("Value preview handler called without database loaded");
+                lock_db!(rdb_handle, guard, rdb);
 
                 if let Some(file) = file {
                     let _ = || -> Result<(), Box<dyn Error>> {
