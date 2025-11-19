@@ -21,6 +21,7 @@ mod worker;
 use std::panic;
 use windows_sys::{core::*, Win32::UI::Shell::*, Win32::UI::WindowsAndMessaging::*};
 
+#[derive(Clone, Copy)]
 enum Formatting {
     None(usize),
     Json(),
@@ -206,7 +207,7 @@ impl RdbData {
                 break;
             }
             let t = Instant::now();
-            let key = std::str::from_utf8(it.key().expect("Database invalid iterator access."))?;
+            let key = std::str::from_utf8(it.key().expect("Database invalid iterator access."))?; // This shouldn't fail, as iterator is validated as loop condition
 
             keys.push(key.to_string());
 
@@ -291,8 +292,15 @@ fn open_db(path: String, ui_handle: &slint::Weak<AppWindow>, rdb_handle: &Arc<Mu
                     let cf_names = rdb.cf_names.clone();
 
                     {
-                        let mut rdb_guard = rdb_handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
-                        *rdb_guard = Some(rdb);
+                        match rdb_handle.lock() {
+                            Ok(mut rdb_guard) => {
+                                *rdb_guard = Some(rdb);
+                            }
+                            Err(_) => {
+                                // main thread crashed, nothing more to do here
+                                return;
+                            }
+                        }
                     }
 
                     let path_clone = path.clone();
@@ -310,8 +318,9 @@ fn open_db(path: String, ui_handle: &slint::Weak<AppWindow>, rdb_handle: &Arc<Mu
                     }).map_err(print_stderr);
                 },
                 Err(err) => {
-                    // TODO pass this error msg to UI
-                    println!("{}", err.into_string());
+                    let _ = ui_clone.upgrade_in_event_loop(move |ui| {
+                        ui.set_status_msg(err.to_string().into());
+                    });
                 },
             }
 
@@ -338,6 +347,7 @@ fn print_stderr(err: slint::EventLoopError) {
 
 macro_rules! lock_db {
     ($handle:ident, $guard:ident, $rdb:ident) => {
+        // TODO potentially try to revive worker thread? The rdb reference should work fine as there's only read access.
         let $guard = $handle.lock().expect("rdb mutex poisoned. Worker thread panicked during db access?");
         let $rdb = $guard.as_ref().expect("Value preview handler called without database loaded");
     };
@@ -353,20 +363,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         let critical_error_occured = critical_error_occurred.clone();
         move |panic_info| {
         let msg = format!("{panic_info}");
-        unsafe {
 
-            {
-                // if this lock fails then no msg will be printed and app exit code will be 0. 
-                // Should I fix this with an AtomicBool or sth, or is this failure impossible?
-                if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
-                    *critical_error_guard = Some(msg.clone());
-                }
+        {
+            // if this lock fails then no msg will be printed and app exit code will be 0. 
+            // Should I fix this with an AtomicBool or sth, or is this failure impossible?
+            if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
+                *critical_error_guard = Some(msg.clone());
             }
+        }
 
-            let _ = ui.upgrade_in_event_loop(|ui| {
-                ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
-            });
+        let _ = ui.upgrade_in_event_loop(|ui| {
+            ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
+        });
 
+        unsafe {
             ShellMessageBoxA(
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
@@ -406,7 +416,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let folder = rfd::FileDialog::new().set_directory("./").pick_folder();
 
             if let Some(path) = folder {
-                let path = path.into_os_string().into_string().expect("Got string which is inconvertible to UTF-8 from folder picker.");
+                let path = path.into_os_string().into_string().expect("Got string which is inconvertible to UTF-8 from folder picker."); // No idea if folder picker can return me an invalid string.
                 open_db(path, &ui_handle, &rdb_handle, &worker);
             }
         }
@@ -422,9 +432,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             }
 
-            if let Some(ui) = ui_handle.upgrade() {
-                let formatting = get_formatting(ui_formatting.as_str(), 2048);
+            let formatting = get_formatting(ui_formatting.as_str(), 2048);
 
+            // fast enough to not do it on a separate thread... at least for now
+            if let Some(ui) = ui_handle.upgrade() {
                 lock_db!(rdb_handle, guard, rdb);
                 db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, false);
             }
@@ -432,6 +443,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // TODO shares most code with preview
+    // TODO move to background thread
     ui.on_change_db_value_full_view({
         let ui_handle = ui.as_weak();
         let rdb_handle = rdb_data_src.clone();
@@ -442,11 +454,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             }
 
+            let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
+
             if let Some(ui) = ui_handle.upgrade() {
                 lock_db!(rdb_handle, guard, rdb);
-
-                let formatting = get_formatting(ui_formatting.as_str(), usize::MAX);
-
                 db_value_preview_handler(&ui, rdb, cf.as_str(), key.as_str(), formatting, true);
             }
         }
@@ -567,7 +578,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         // if the expect fails it means something must've changed the TableView inbetween
                                         // in current design, this operation is not holding table view exclusively, which leaves it open for such bug
                                         // TODO in such ocurrence display an explicit dialog, instead of panicking the app?
-                                        handle.global::<TableViewPageAdapter>().get_row_data().row_data_tracked(i).expect(format!("Failed to get {} row of KV Table", i).as_str()).set_row_data(1, value.as_str().into());
+                                        handle.global::<TableViewPageAdapter>()
+                                            .get_row_data()
+                                            .row_data_tracked(i)
+                                            .expect(format!("Failed to get {} row of KV Table", i).as_str())
+                                            .set_row_data(1, value.as_str().into());
                                         handle.set_work_progress(progress);
                                     }
                                 }).map_err(print_stderr);
