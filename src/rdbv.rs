@@ -575,13 +575,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let _ = ui.upgrade_in_event_loop({
                                     let progress = i as f32 / keys.len() as f32;
                                     move |handle|{
-                                        // if the expect fails it means something must've changed the TableView inbetween
-                                        // in current design, this operation is not holding table view exclusively, which leaves it open for such bug
-                                        // TODO in such ocurrence display an explicit dialog, instead of panicking the app?
                                         handle.global::<TableViewPageAdapter>()
                                             .get_row_data()
-                                            .row_data_tracked(i)
-                                            .expect(format!("Failed to get {} row of KV Table", i).as_str())
+                                            .row_data(i)
+                                            .expect(format!("Failed to get {} row of KV Table", i).as_str()) // shouldn't fail as the table was preallocated with keys, which are reused here to populate values
                                             .set_row_data(1, value.as_str().into());
                                         handle.set_work_progress(progress);
                                     }
