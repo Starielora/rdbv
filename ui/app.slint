@@ -276,35 +276,38 @@ export component AppWindow inherits Window {
                         wrap: TextWrap.char-wrap;
                     }
 
-                    HorizontalBox {
-                        alignment: end;
-                        Text {
-                            vertical-alignment: center;
-                            text: "Format";
-                        }
-
-                        formatting := ComboBox {
-                            model: ["None", "json", "hex"];
-                            max-width: 24px;
-                            selected(current-value) => {
-                                change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                    VerticalLayout {
+                        alignment: LayoutAlignment.start;
+                        HorizontalBox {
+                            alignment: end;
+                            Text {
+                                vertical-alignment: center;
+                                text: "Format";
                             }
-                        }
 
-                        // TODO this is so jank, but I'm so tired rn
-                        ComboBox {
-                            model: ["Value…", "Export", "Full preview"];
-                            selected(current-value) => {
-                                self.current-index = 0;
-                                if get_current_cf().is-empty || get_current_key().is-empty {
-                                    return;
+                            formatting := ComboBox {
+                                model: ["None", "json", "hex"];
+                                max-width: 24px;
+                                selected(current-value) => {
+                                    change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
                                 }
-                                if current-value == "Export" {
-                                    DbLoader.export_value_to_file(get_current_cf(), get_current_key());
-                                } else if current-value == "Full preview" {
-                                    change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
-                                    full_value_popup.show();
-                                } else {
+                            }
+
+                            // TODO this is so jank, but I'm so tired rn
+                            ComboBox {
+                                model: ["Value…", "Export", "Full preview"];
+                                selected(current-value) => {
+                                    self.current-index = 0;
+                                    if get_current_cf().is-empty || get_current_key().is-empty {
+                                        return;
+                                    }
+                                    if current-value == "Export" {
+                                        DbLoader.export_value_to_file(get_current_cf(), get_current_key());
+                                    } else if current-value == "Full preview" {
+                                        change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
+                                        full_value_popup.show();
+                                    } else {
+                                    }
                                 }
                             }
                         }
