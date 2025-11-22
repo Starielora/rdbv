@@ -100,6 +100,8 @@ export component AppWindow inherits Window {
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
     callback change_db_value_full_view(string, string, string);
+    callback stop_querying_values();
+    callback query_remaining_values([[StandardListViewItem]], string);
     function get_current_cf() -> string {
         return ListViewAdapter.list_items[column_families.current-item].text;
     }
@@ -219,6 +221,13 @@ export component AppWindow inherits Window {
                         query_values := Switch {
                             text: "Query values";
                             checked: true;
+                            changed checked => {
+                                if self.checked {
+                                    query_remaining_values(TableViewPageAdapter.row_data, get_current_cf());
+                                } else {
+                                    stop_querying_values();
+                                }
+                            }
                         }
                     }
                 }

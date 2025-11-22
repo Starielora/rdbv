@@ -353,6 +353,55 @@ macro_rules! lock_db {
     };
 }
 
+fn query_remaining_values(ui: slint::Weak<AppWindow>, cf: String, keys: &Vec<String>, offset: usize, rdb_handle: Arc<Mutex<Option<RdbData>>>, cancel: &AtomicBool) -> Result<(), Box<dyn Error>> {
+
+    let _ = ui.upgrade_in_event_loop(move |handle|{
+        handle.set_work_progress(0.0);
+        handle.set_work_in_progress(true);
+    }).map_err(print_stderr);
+
+    let mut total_values_query_time = Duration::new(0, 0);
+    for (i, key) in keys.iter().skip(offset).enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        let i = i + offset;
+
+        let progress_bar_title = format!("Loading {}", key);
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            ui.set_work_in_progress_name(progress_bar_title.into());
+        }).map_err(print_stderr);
+
+        let start = Instant::now();
+        let value = {
+            lock_db!(rdb_handle, guard, rdb);
+            rdb.get_val(cf.as_ref(), key, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string()
+        };
+
+        total_values_query_time = total_values_query_time.add(start.elapsed());
+
+        let _ = ui.upgrade_in_event_loop({
+            let progress = i as f32 / keys.len() as f32;
+            move |handle|{
+                handle.global::<TableViewPageAdapter>()
+                    .get_row_data()
+                    .row_data(i)
+                    .expect(format!("Failed to get {} row of KV Table", i).as_str()) // shouldn't fail as the table was preallocated with keys, which are reused here to populate values
+                    .set_row_data(1, value.as_str().into());
+                handle.set_work_progress(progress);
+            }
+        }).map_err(print_stderr);
+    }
+
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
+        ui.set_work_in_progress(false);
+    }).map_err(print_stderr);
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
 
     let ui = AppWindow::new()?;
@@ -419,6 +468,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let path = path.into_os_string().into_string().expect("Got string which is inconvertible to UTF-8 from folder picker."); // No idea if folder picker can return me an invalid string.
                 open_db(path, &ui_handle, &rdb_handle, &worker);
             }
+        }
+    });
+
+    ui.on_stop_querying_values({
+        let worker = worker.clone();
+        move || {
+            // super jank implementation. It basically means that any operation can be cancelled with the switch, but whatever.
+            // I'll fix it if it starts causing issues
+            worker.cancel_currently_scheduled_work();
         }
     });
 
@@ -545,50 +603,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }).map_err(print_stderr);
 
                         if query_values {
-
-                            let ui = ui_handle.clone();
-                            let _ = ui.upgrade_in_event_loop(move |handle|{
-                                handle.set_work_progress(0.0);
-                                handle.set_work_in_progress(true);
-                            }).map_err(print_stderr);
-
-                            let cf = cf.clone();
-                            let mut total_values_query_time = Duration::new(0, 0);
-                            for (i, key) in keys.iter().enumerate() {
-                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break;
-                                }
-
-                                let progress_bar_title = format!("Loading {}", key);
-                                let _ = ui.upgrade_in_event_loop(move |ui| {
-                                    ui.set_work_in_progress_name(progress_bar_title.into());
-                                }).map_err(print_stderr);
-
-                                let start = Instant::now();
-                                let value = {
-                                    lock_db!(rdb_handle, guard, rdb);
-                                    rdb.get_val(cf.as_ref(), key, Formatting::None(2048))?.lines().nth(0).ok_or("Failed to extract first line from value to display in UI")?.to_string()
-                                };
-
-                                total_values_query_time = total_values_query_time.add(start.elapsed());
-
-                                let _ = ui.upgrade_in_event_loop({
-                                    let progress = i as f32 / keys.len() as f32;
-                                    move |handle|{
-                                        handle.global::<TableViewPageAdapter>()
-                                            .get_row_data()
-                                            .row_data(i)
-                                            .expect(format!("Failed to get {} row of KV Table", i).as_str()) // shouldn't fail as the table was preallocated with keys, which are reused here to populate values
-                                            .set_row_data(1, value.as_str().into());
-                                        handle.set_work_progress(progress);
-                                    }
-                                }).map_err(print_stderr);
-                            }
-
-                            let _ = ui.upgrade_in_event_loop(move |ui| {
-                                ui.set_status_msg(format!("{} values query time: {:?}", cf, total_values_query_time).into());
-                                ui.set_work_in_progress(false);
-                            }).map_err(print_stderr);
+                            query_remaining_values(ui_handle, cf.to_string(), &keys, 0, rdb_handle, &cancel)?;
                         }
                         Ok(())
                     };
@@ -606,6 +621,31 @@ fn main() -> Result<(), Box<dyn Error>> {
             }}));
 
             worker.push_tasks(tasks);
+        }
+    });
+
+    ui.on_query_remaining_values({
+        let ui_handle = ui.as_weak();
+        let rdb_handle = rdb_data_src.clone();
+        let worker = worker.clone();
+        move |table, cf| {
+            // TODO unwraps
+            if let Some(first_empty_index) = table.iter().position(|item| { item.row_data(1).unwrap().text.is_empty() }) {
+                let keys = table.iter().map(|item| {item.row_data(0).unwrap().text.to_string()}).collect::<Vec<String>>();
+
+                let mut tasks: Vec<Box<dyn Fn(&AtomicBool) + Send>> = Vec::new();
+
+                tasks.push(Box::new({
+                    let ui_handle = ui_handle.clone();
+                    let rdb_handle = rdb_handle.clone();
+                    let cf = cf.to_string();
+                    move |cancel| {
+                        query_remaining_values(ui_handle.clone(), cf.clone(), &keys, first_empty_index, rdb_handle.clone(), cancel).unwrap();
+                    }
+                }));
+
+                worker.push_tasks(tasks);
+            }
         }
     });
 
