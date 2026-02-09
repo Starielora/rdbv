@@ -1,4 +1,4 @@
-// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Write;
 use std::ops::Add;
@@ -407,34 +407,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ui = AppWindow::new()?;
     let critical_error_occurred: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Option::None));
 
-    panic::set_hook(Box::new({
-        let ui = ui.as_weak();
-        let critical_error_occured = critical_error_occurred.clone();
-        move |panic_info| {
-        let msg = format!("{panic_info}");
+    if cfg!(windows) {
+        panic::set_hook(Box::new({
+            let ui = ui.as_weak();
+            let critical_error_occured = critical_error_occurred.clone();
+            move |panic_info| {
+            let msg = format!("{panic_info}");
 
-        {
-            // if this lock fails then no msg will be printed and app exit code will be 0. 
-            // Should I fix this with an AtomicBool or sth, or is this failure impossible?
-            if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
-                *critical_error_guard = Some(msg.clone());
+            {
+                // if this lock fails then no msg will be printed and app exit code will be 0. 
+                // Should I fix this with an AtomicBool or sth, or is this failure impossible?
+                if let Ok(mut critical_error_guard) = critical_error_occured.lock() {
+                    *critical_error_guard = Some(msg.clone());
+                }
             }
-        }
 
-        let _ = ui.upgrade_in_event_loop(|ui| {
-            ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
-        });
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.window().dispatch_event(slint::platform::WindowEvent::CloseRequested);
+            });
 
-        unsafe {
-            ShellMessageBoxA(
+            println!("{}", msg);
+
+            unsafe {
+                ShellMessageBoxA(
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
                 msg.as_ptr(),
                 s!("Critical error"),
                 MB_ICONERROR,
-            );
-        }
-    }}));
+                );
+            }
+        }}));
+    }
 
 
     let notice_text = include_bytes!("../NOTICE");
