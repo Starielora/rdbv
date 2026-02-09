@@ -388,7 +388,7 @@ fn query_remaining_values(ui: slint::Weak<AppWindow>, cf: String, keys: &Vec<Str
                     .get_row_data()
                     .row_data(i)
                     .expect(format!("Failed to get {} row of KV Table", i).as_str()) // shouldn't fail as the table was preallocated with keys, which are reused here to populate values
-                    .set_row_data(1, value.as_str().into());
+                    .set_row_data(2, value.as_str().into());
                 handle.set_work_progress(progress);
             }
         }).map_err(print_stderr);
@@ -582,9 +582,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                         // TODO could preallocate this vec when getting keys instead of copying
                         // For now perf is sufficient
-                        let mut row_data: Vec<(String, String)> = Vec::new();
-                        for k in keys.iter() {
-                            row_data.push((k.to_string(), "".to_string()));
+                        let mut row_data: Vec<(String, String, String)> = Vec::new();
+                        for (index, k) in keys.iter().enumerate() {
+                            row_data.push((index.to_string(), k.to_string(), "".to_string()));
                         }
 
                         let _ = ui_handle.upgrade_in_event_loop({
@@ -593,8 +593,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let ui_row_data: VecModel<slint::ModelRc<StandardListViewItem>> = VecModel::default();
 
                                 // VecModel is not Send and cannot be prepared on second thread.
-                                for (k, v) in row_data.iter() {
+                                for (i, k, v) in row_data.iter() {
                                     let items = Rc::new(VecModel::default());
+                                    items.push(i.as_str().into());
                                     items.push(k.as_str().into());
                                     items.push(v.as_str().into());
                                     ui_row_data.push(items.into());
