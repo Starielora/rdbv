@@ -446,6 +446,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ui.set_window_name(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).into());
 
     ui.global::<TableViewPageAdapter>().set_row_data(Rc::new(VecModel::default()).into());
+    ui.global::<TableViewPageAdapter>().on_filter_sort_model(filter_sort_model);
     ui.global::<ListViewAdapter>().set_list_items(Rc::new(VecModel::default()).into());
 
     let worker = Arc::new(worker::WorkerThread::new());
@@ -701,4 +702,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     Ok(())
+}
+
+fn filter_sort_model(
+    source_model: slint::ModelRc<slint::ModelRc<slint::StandardListViewItem>>,
+    filter: slint::SharedString,
+    sort_index: i32,
+    sort_ascending: bool,
+) -> slint::ModelRc<slint::ModelRc<slint::StandardListViewItem>> {
+    let mut model = source_model.clone();
+
+    if !filter.is_empty() {
+        let filter = filter.to_lowercase();
+
+        // filter by first row
+        model =
+            Rc::new(source_model.clone().filter(move |e| {
+                e.row_data(1).unwrap().text.to_lowercase().contains(filter.as_str())
+            }))
+            .into();
+    }
+
+    if sort_index >= 0 {
+        model = Rc::new(model.clone().sort_by(move |r_a, r_b| {
+            let c_a = r_a.row_data(sort_index as usize).unwrap();
+            let c_b = r_b.row_data(sort_index as usize).unwrap();
+
+            if sort_ascending { c_a.text.cmp(&c_b.text) } else { c_b.text.cmp(&c_a.text) }
+        }))
+        .into();
+    }
+
+    model
 }

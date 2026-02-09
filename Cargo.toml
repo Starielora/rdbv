@@ -18,7 +18,7 @@ path = "src/rdbv.rs"
 [dependencies]
 rocksdb = { path="rust-rocksdb" }
 scopeguard = "1.2.0"
-slint = "1.13.1"
+slint = "1.15.0"
 formatjson = "0.3.1"
 rfd = "0.15.4"
 windows-sys = { version="0.61.2", features = [ "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell" ] }

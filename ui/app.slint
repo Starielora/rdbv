@@ -29,6 +29,8 @@ export global TableViewPageAdapter {
         [{text: "id1"}, { text:"key2" }, { text:"val2" }],
         [{text: "id1"}, { text:"key3" }, { text:"val3" }],
     ];
+
+    pure callback filter_sort_model([[StandardListViewItem]], string, int, bool) -> [[StandardListViewItem]];
 }
 
 export global ListViewAdapter {
@@ -97,6 +99,9 @@ export component AppWindow inherits Window {
     in property <bool> progress_is_indeterminate;
     in property <string> notice_text;
     in property <string> window_name;
+    property <int> sort_index: -1;
+    property <bool> sort_ascending;
+    property <string> current_key;
     callback change_db_value_preview(string, string, string);
     callback change_column_family(string, bool);
     callback change_db_value_full_view(string, string, string);
@@ -105,9 +110,7 @@ export component AppWindow inherits Window {
     function get_current_cf() -> string {
         return ListViewAdapter.list_items[column_families.current-item].text;
     }
-    function get_current_key() -> string {
-        return TableViewPageAdapter.row_data[kv.current-row][0].text;
-    }
+
     full_value_popup := PopupWindow {
         full_value_preview := FullValuePreview {
             height: 100%;
@@ -115,7 +118,7 @@ export component AppWindow inherits Window {
             opacity: 98%;
             full_value: db_full_value_preview;
             current_cf: get_current_cf();
-            current_key: get_current_key();
+            current_key: root.current_key;
         }
 
         x: parent.x + 40px;
@@ -247,16 +250,32 @@ export component AppWindow inherits Window {
                 }
 
                 kv := StandardTableView {
+                    sort-ascending(index) => {
+                        root.sort_index = index;
+                        root.sort_ascending = true;
+                    }
+
+                    sort-descending(index) => {
+                        root.sort_index = index;
+                        root.sort_ascending = false;
+                    }
+
                     columns: [
                         { title: @tr("index"), width: 100px, },
                         { title: @tr("key") },
                         { title: @tr("value") },
                     ];
-                    rows: TableViewPageAdapter.row_data;
+
+                    rows: TableViewPageAdapter.filter_sort_model(TableViewPageAdapter.row_data, filter-edit.text, root.sort_index, root.sort_ascending);
+
                     current-row-changed(current-row) => {
-                        let key = TableViewPageAdapter.row_data[current-row][0].text;
-                        change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                        root.current_key = self.rows[current-row][1].text;
+                        change_db_value_preview(get_current_cf(), root.current_key, formatting.current-value);
                     }
+                }
+
+                filter-edit := LineEdit {
+                    placeholder-text: @tr("Enter key filter");
                 }
 
                 GroupBox {
@@ -266,15 +285,15 @@ export component AppWindow inherits Window {
                             height: 46px;
                             preferred-height: 46px;
                             read-only: true;
-                            text: get_current_key();
-                            enabled: !get_current_key().is-empty;
+                            text: root.current_key;
+                            enabled: !root.current_key.is-empty;
                         }
 
                         preview := TextEdit {
                             min-height: 64px;
                             read-only: true;
                             text: db_value_preview;
-                            enabled: !get_current_key().is-empty;
+                            enabled: !root.current_key.is-empty;
                         }
                     }
                 }
@@ -299,7 +318,7 @@ export component AppWindow inherits Window {
                                 model: ["None", "json", "hex"];
                                 max-width: 24px;
                                 selected(current-value) => {
-                                    change_db_value_preview(get_current_cf(), get_current_key(), formatting.current-value);
+                                    change_db_value_preview(get_current_cf(), root.current_key, formatting.current-value);
                                 }
                             }
 
@@ -308,13 +327,13 @@ export component AppWindow inherits Window {
                                 model: ["Value…", "Export", "Full preview"];
                                 selected(current-value) => {
                                     self.current-index = 0;
-                                    if get_current_cf().is-empty || get_current_key().is-empty {
+                                    if get_current_cf().is-empty || root.current_key.is-empty {
                                         return;
                                     }
                                     if current-value == "Export" {
-                                        DbLoader.export_value_to_file(get_current_cf(), get_current_key());
+                                        DbLoader.export_value_to_file(get_current_cf(), root.current_key);
                                     } else if current-value == "Full preview" {
-                                        change_db_value_full_view(get_current_cf(), get_current_key(), formatting.current-value);
+                                        change_db_value_full_view(get_current_cf(), root.current_key, formatting.current-value);
                                         full_value_popup.show();
                                     } else {
                                     }
